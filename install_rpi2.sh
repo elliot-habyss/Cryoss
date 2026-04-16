@@ -334,7 +334,7 @@ Match User ds-repl
     X11Forwarding no
     PermitTTY no
 SSH_EOF
-echo "[ Cryoss RPi2 | $CLIENT_NAME — accès SSH via RPi1(10.42.0.1) uniquement ]" > /etc/ssh/banner
+echo "[ Cryoss - Acces restreint ]" > /etc/ssh/banner
 systemctl restart ssh
 ok "SSH durci (AllowUsers: habyss + ds-repl)"
 

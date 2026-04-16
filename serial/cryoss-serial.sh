@@ -13,7 +13,6 @@
 # Le serial est :
 #   - Généré une seule fois à l'installation
 #   - Inclus dans chaque réponse API (identification du RPi)
-#   - Utilisé pour dériver le port du tunnel SSH inverse (unicité)
 #   - Inclus dans les emails de rapport/alertes
 #   - Affiché dans la bannière SSH
 # ===========================================================================
@@ -52,33 +51,10 @@ set_serial() {
     echo "$serial"
 }
 
-get_tunnel_port() {
-    # Dérive un port SSH tunnel unique à partir du serial
-    # Range : 20000-29999 (10000 ports possibles = largement assez pour 50+ clients)
-    #
-    # Algorithme : hash du serial → modulo 10000 + 20000
-    local serial="${1:-$(get_serial)}"
-    local hash
-    hash=$(echo -n "$serial" | sha256sum | head -c 8)
-    local port=$(( 16#$hash % 10000 + 20000 ))
-    echo "$port"
-}
-
-get_api_tunnel_port() {
-    # Port tunnel pour l'API = tunnel_port + 10000
-    # Range : 30000-39999
-    local ssh_port="${1:-$(get_tunnel_port)}"
-    echo $(( ssh_port + 10000 ))
-}
-
 show_info() {
     local serial=$(get_serial)
-    local ssh_port=$(get_tunnel_port "$serial")
-    local api_port=$(get_api_tunnel_port "$ssh_port")
     echo "━━━ Cryoss Serial Info ━━━"
     echo "  Serial     : $serial"
-    echo "  SSH tunnel : port $ssh_port"
-    echo "  API tunnel : port $api_port"
     echo "  File       : $SERIAL_FILE"
 }
 
@@ -87,11 +63,9 @@ case "${1:-info}" in
     generate)  generate_serial ;;
     get)       get_serial ;;
     set)       set_serial "${2:-}" ;;
-    port)      get_tunnel_port ;;
-    api-port)  get_api_tunnel_port ;;
     info)      show_info ;;
     *)
-        echo "Usage: $0 {generate|get|set <SN>|port|api-port|info}"
+        echo "Usage: $0 {generate|get|set <SN>|info}"
         exit 1
         ;;
 esac

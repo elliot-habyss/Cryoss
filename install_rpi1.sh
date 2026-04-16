@@ -40,13 +40,18 @@ info "seront auto-generees et sauvegardees dans /etc/cryoss/keys-backup.conf"
 info "Chaque chemin (local, RPi2, SFTP) a ses propres cles independantes."
 
 step "Email (msmtp)"
-read -rp "  Hote SMTP          : " SMTP_HOST
-read -rp "  Port SMTP          : " SMTP_PORT
-read -rp "  Expediteur         : " SMTP_FROM
-read -rp "  Utilisateur SMTP   : " SMTP_USER
-read -rsp "  Mot de passe SMTP  : " SMTP_PASS; echo
-read -rp "  Email destinataire 1        : " EMAIL_TO
-read -rp "  Email destinataire 2        : " EMAIL_TO_2
+# Valeurs fixes Analyss — ne changent jamais
+SMTP_HOST="ex5.mail.ovh.net"
+SMTP_PORT="587"
+SMTP_FROM="alertes@habyss.fr"
+SMTP_USER="alertes@habyss.fr"
+info "SMTP : $SMTP_USER via $SMTP_HOST:$SMTP_PORT"
+read -rsp "  Mot de passe SMTP ($SMTP_USER) : " SMTP_PASS; echo
+[[ -z "$SMTP_PASS" ]] && err "Mot de passe SMTP obligatoire"
+# Destinataire 1 = toujours support@habyss.fr (Analyss)
+EMAIL_TO="support@habyss.fr"
+info "Destinataire 1 (fixe) : $EMAIL_TO"
+read -rp "  Email destinataire client (optionnel) : " EMAIL_TO_2
 EMAIL_TO_2="${EMAIL_TO_2:-}"
 
 step "Reseau RPi1 (IP fixe)"
@@ -98,12 +103,11 @@ fi
 
 step "RAID 1 (4 disques)"
 echo "  Disques :"; lsblk -d -o NAME,SIZE,MODEL 2>/dev/null | grep -v "^NAME\|mmcblk\|nvme" || true; echo
-read -rp "  Disque 1 pour md0 (ex: sda) : " DISK1
-read -rp "  Disque 2 pour md0 (ex: sdb) : " DISK2
-read -rp "  Disque 1 pour md1 (ex: sdc) : " DISK3
-read -rp "  Disque 2 pour md1 (ex: sdd) : " DISK4
-DISK1="/dev/${DISK1##/dev/}"; DISK2="/dev/${DISK2##/dev/}"
-DISK3="/dev/${DISK3##/dev/}"; DISK4="/dev/${DISK4##/dev/}"
+# Layout fixe : md0=sda+sdb (sauvegarde), md1=sdc+sdd (encrypted)
+DISK1="/dev/sda"; DISK2="/dev/sdb"
+DISK3="/dev/sdc"; DISK4="/dev/sdd"
+info "RAID md0 : $DISK1 + $DISK2 -> /etc/sauvegarde"
+info "RAID md1 : $DISK3 + $DISK4 -> /etc/encrypted"
 
 step "Utilisateurs"
 DS_PASS=$(openssl rand -base64 16)
@@ -137,9 +141,10 @@ read -rp "Confirmer ? [o/N] : " CONFIRM
 step "1. Paquets"
 # TOUS les paquets ici — avant toute manipulation réseau ou UFW
 apt-get update -qq
-# postfix en DEBIAN_FRONTEND=noninteractive pour éviter le menu interactif
+# msmtp-mta fournit mail-transport-agent — postfix entre en conflit, on le vire
+apt-get remove -y postfix 2>/dev/null || true
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    openssl msmtp msmtp-mta samba mdadm ufw fail2ban curl smartmontools postfix
+    openssl msmtp msmtp-mta samba mdadm ufw fail2ban curl smartmontools
 ok "Paquets de base installés"
 
 # rclone est OBLIGATOIRE (utilise pour les 3 chemins de chiffrement)
@@ -438,9 +443,14 @@ Host cryoss-rpi2
 SSHEOF
 chmod 600 /root/.ssh/config
 
-echo -e "\n${YELLOW}${BOLD}ACTION REQUISE — Cle publique a copier sur RPi2 :${NC}"
-echo -e "${BOLD}"; cat "${SSH_KEY_PATH}.pub"; echo -e "${NC}"
-read -rp "  Entree une fois la cle copiee sur RPi2..."
+# Copier la cle SSH vers RPi2 pour acces sans mot de passe
+info "Copie de la cle SSH vers RPi2..."
+if ssh-copy-id -i /root/.ssh/cryoss_rpi2.pub -o StrictHostKeyChecking=accept-new habyss@10.42.0.2 2>/dev/null; then
+    ok "Cle SSH copiee vers RPi2 (habyss@10.42.0.2)"
+else
+    warn "Copie de la cle SSH vers RPi2 echouee — faites-le manuellement :"
+    warn "  ssh-copy-id -i /root/.ssh/cryoss_rpi2.pub habyss@10.42.0.2"
+fi
 
 info "Test SSH RPi2..."
 if ssh -o ConnectTimeout=5 cryoss-rpi2 "mkdir -p $RPI2_DIR && echo OK" 2>/dev/null; then
@@ -887,6 +897,15 @@ cat > /etc/samba/smb.conf <<SAMBA_EOF
    create mask = 0660
    directory mask = 2770
    force group = samba-share
+   vfs objects = fruit streams_xattr
+   fruit:metadata = stream
+   fruit:model = MacSamba
+   fruit:posix_rename = yes
+   fruit:veto_appledouble = no
+   fruit:nfs_aces = no
+   fruit:wipe_intentionally_left_blank_rfork = yes
+   fruit:delete_empty_adfiles = yes
+   strict allocate = yes
 
 [encrypted_backup]
    comment = Archives chiffrees [$CLIENT_NAME] (lecture seule)
@@ -1003,7 +1022,7 @@ ClientAliveCountMax 2
 AllowUsers habyss
 Banner /etc/ssh/banner
 SSH_EOF
-echo "[ Cryoss RPi1 - Acces restreint | $CLIENT_NAME ]" > /etc/ssh/banner
+echo "[ Cryoss - Acces restreint ]" > /etc/ssh/banner
 systemctl restart ssh
 ok "SSH durci (AllowUsers=habyss)"
 

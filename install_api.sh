@@ -1,6 +1,6 @@
 #!/bin/bash
 # ===========================================================================
-# Cryoss v2 — Installation API + Serial + Tunnel
+# Cryoss v2 — Installation API + Serial + Heartbeat
 # ===========================================================================
 # À exécuter APRÈS install_rpi1.sh ou install_rpi2.sh
 #
@@ -8,11 +8,10 @@
 #   1. Le numéro de série unique (si pas déjà généré)
 #   2. L'API REST de contrôle distant (FastAPI)
 #   3. Le service systemd pour l'API
-#   4. (Optionnel) Le tunnel SSH inverse
+#   4. Le heartbeat phone-home vers Analyss (HTTPS push)
 #
 # Usage :
 #   sudo bash install_api.sh
-#   sudo bash install_api.sh --with-tunnel
 # ===========================================================================
 
 set -euo pipefail
@@ -27,9 +26,6 @@ step() { echo -e "\n${BOLD}${BLUE}━━━ $1 ━━━${NC}"; }
 
 [[ $EUID -ne 0 ]] && err "Ce script doit être exécuté en root"
 
-WITH_TUNNEL=false
-[[ "${1:-}" == "--with-tunnel" ]] && WITH_TUNNEL=true
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # --- Détection du rôle ---
@@ -37,7 +33,7 @@ if [[ -f /usr/local/bin/cryoss-backup.sh ]]; then
     ROLE="rpi1"
     API_HOST="127.0.0.1"
     API_PORT=8420
-elif [[ -f /usr/local/bin/cryoss-repl-check.sh ]]; then
+elif ip addr show 2>/dev/null | grep -q "10.42.0.2"; then
     ROLE="rpi2"
     API_HOST="10.42.0.2"
     API_PORT=8421
@@ -81,16 +77,6 @@ echo "$SERIAL" > /etc/cryoss/serial
 chmod 644 /etc/cryoss/serial
 ok "Serial : $SERIAL"
 
-TUNNEL_SSH_PORT=$(/usr/local/bin/cryoss-serial.sh port)
-TUNNEL_API_PORT=$(/usr/local/bin/cryoss-serial.sh api-port)
-info "Ports tunnel dérivés : SSH=$TUNNEL_SSH_PORT, API=$TUNNEL_API_PORT"
-
-# Ajouter le serial à la bannière SSH existante
-if [[ -f /etc/ssh/banner ]]; then
-    if ! grep -q "$SERIAL" /etc/ssh/banner 2>/dev/null; then
-        sed -i "s/\]/ | $SERIAL]/" /etc/ssh/banner
-    fi
-fi
 
 # ===========================================================================
 # STEP 2 : Dépendances Python
@@ -272,17 +258,86 @@ if [[ "$ROLE" == "rpi2" ]]; then
 fi
 
 # ===========================================================================
-# STEP 6 : Tunnel SSH inverse (optionnel)
+# STEP 6 : Heartbeat phone-home vers Analyss (RPi1 uniquement)
 # ===========================================================================
-if [[ "$WITH_TUNNEL" == true && "$ROLE" == "rpi1" ]]; then
-    step "6. Tunnel SSH inverse"
-    bash "$SCRIPT_DIR/tunnel/cryoss-tunnel.sh"
-else
-    if [[ "$ROLE" == "rpi1" ]]; then
-        info "Tunnel non installé — relancez avec : sudo bash install_api.sh --with-tunnel"
+# RPi2 est air-gapped — il n'envoie PAS de heartbeat directement.
+# RPi1 collecte les donnees de RPi2 via SSH interco et les inclut dans son heartbeat.
+if [[ "$ROLE" == "rpi1" ]]; then
+    step "6. Heartbeat Analyss"
+
+    cp "$SCRIPT_DIR/heartbeat/cryoss-heartbeat.sh" /usr/local/bin/cryoss-heartbeat.sh
+    chmod 755 /usr/local/bin/cryoss-heartbeat.sh
+    ok "Script heartbeat installe"
+
+    # Config Analyss
+    ANALYSS_CONF="/etc/cryoss/analyss.conf"
+    if [[ -f "$ANALYSS_CONF" ]]; then
+        info "Config Analyss existante conservee"
     else
-        info "Tunnel non applicable sur RPi2 (air-gapped)"
+        read -rp "  URL Analyss (ex: https://app.analyss.fr) : " ANALYSS_URL
+        ANALYSS_URL="${ANALYSS_URL:-https://app.analyss.fr}"
+        cat > "$ANALYSS_CONF" <<ANALYSS_EOF
+# Cryoss heartbeat — connexion vers Analyss
+ANALYSS_URL="${ANALYSS_URL}"
+ANALYSS_API_KEY=""
+ANALYSS_EOF
+        chmod 600 "$ANALYSS_CONF"
+        chown root:cryoss-api "$ANALYSS_CONF" 2>/dev/null || true
+        ok "Config Analyss creee ($ANALYSS_CONF)"
+        info "L'API key sera obtenue lors du premier enregistrement"
+        info "Lancer : sudo cryoss-heartbeat.sh register"
     fi
+
+    # Timer systemd heartbeat (toutes les 5 min)
+    cat > /etc/systemd/system/cryoss-heartbeat.service <<HB_SVC_EOF
+[Unit]
+Description=Cryoss Heartbeat [$SERIAL] ($ROLE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cryoss-heartbeat.sh
+StandardOutput=append:/var/log/cryoss-heartbeat.log
+StandardError=append:/var/log/cryoss-heartbeat.log
+HB_SVC_EOF
+
+    cat > /etc/systemd/system/cryoss-heartbeat.timer <<HB_TMR_EOF
+[Unit]
+Description=Cryoss Heartbeat Timer (5min)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target
+HB_TMR_EOF
+
+    # Logrotate heartbeat
+    cat >> /etc/logrotate.d/cryoss-api <<HB_LOG_EOF
+
+/var/log/cryoss-heartbeat.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    create 640 root root
+}
+HB_LOG_EOF
+
+    touch /var/log/cryoss-heartbeat.log
+    chown root:cryoss-api /var/log/cryoss-heartbeat.log 2>/dev/null || true
+    chmod 640 /var/log/cryoss-heartbeat.log 2>/dev/null || true
+
+    systemctl daemon-reload
+    systemctl enable cryoss-heartbeat.timer
+    systemctl start cryoss-heartbeat.timer
+    ok "Heartbeat timer actif (toutes les 5 min)"
+else
+    info "Heartbeat non installe sur RPi2 (air-gapped, donnees collectees par RPi1)"
 fi
 
 # ===========================================================================
@@ -299,26 +354,13 @@ echo -e "  API            : ${BOLD}http://${API_HOST}:${API_PORT}${NC}"
 echo -e "  Swagger        : ${BOLD}http://${API_HOST}:${API_PORT}/docs${NC}"
 echo -e "  Health check   : ${BOLD}http://${API_HOST}:${API_PORT}/healthz${NC}"
 echo -e "  Clé API        : ${BOLD}$API_KEY_FILE${NC}"
+echo -e "  Heartbeat      : ${BOLD}toutes les 5 min vers Analyss${NC}"
 echo ""
-
-if [[ "$ROLE" == "rpi1" ]]; then
-    echo -e "  ${BOLD}Accès depuis l'extérieur :${NC}"
-    echo -e "    1. SSH tunnel :  ssh -L 8420:localhost:8420 habyss@<IP_PUBLIQUE_CLIENT>"
-    echo -e "    2. Puis :        curl -H 'Authorization: Bearer <KEY>' http://localhost:8420/api/v1/status"
-    echo -e "    3. Swagger :     open http://localhost:8420/docs"
-    echo ""
-    if [[ "$WITH_TUNNEL" == true ]]; then
-        echo -e "  ${BOLD}Accès via tunnel inverse (depuis le VPS) :${NC}"
-        echo -e "    ssh -p $TUNNEL_SSH_PORT habyss@VPS_IP"
-        echo -e "    curl http://localhost:$TUNNEL_API_PORT/healthz"
-    else
-        echo -e "  ${BOLD}Tunnel inverse :${NC} non installé"
-        echo -e "    Installer : sudo bash install_api.sh --with-tunnel"
-    fi
-fi
-
+echo -e "  ${BOLD}Enregistrement Analyss :${NC}"
+echo -e "    sudo cryoss-heartbeat.sh register"
 echo ""
 echo -e "  ${BOLD}Test rapide :${NC}"
 echo -e "    curl http://${API_HOST}:${API_PORT}/healthz"
 echo -e "    curl -H 'Authorization: Bearer \$(cat $API_KEY_FILE)' http://${API_HOST}:${API_PORT}/api/v1/status"
+echo -e "    sudo cryoss-heartbeat.sh    # envoyer un heartbeat maintenant"
 echo ""

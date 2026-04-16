@@ -608,8 +608,8 @@ fi
 # API
 systemctl restart cryoss-api.service 2>/dev/null || true
 
-# Tunnel
-systemctl restart cryoss-tunnel.service 2>/dev/null || true
+# Heartbeat
+systemctl restart cryoss-heartbeat.timer 2>/dev/null || true
 
 # SSH
 systemctl restart ssh 2>/dev/null || true

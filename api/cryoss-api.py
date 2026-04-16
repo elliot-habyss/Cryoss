@@ -3,7 +3,9 @@
 Cryoss v2 — Remote Control API
 =================================
 API REST mince qui wrape les scripts bash Cryoss existants.
-Accessible UNIQUEMENT via tunnel SSH inverse (bind 127.0.0.1).
+Accessible localement (127.0.0.1 sur RPi1, 10.42.0.2 sur RPi2)
+et via SSH vers le RPi. Le heartbeat phone-home pousse les données
+vers Analyss de manière centralisée.
 
 Sécurité :
   - Bind localhost ONLY (jamais 0.0.0.0)
@@ -19,8 +21,8 @@ Usage :
   uvicorn cryoss-api:app --host 127.0.0.1 --port 8420
   # ou via systemd : systemctl start cryoss-api
 
-Depuis l'app de contrôle :
-  ssh -L 8420:localhost:8420 habyss@<CLIENT_IP>
+Accès distant :
+  ssh habyss@<CLIENT_IP> -L 8420:localhost:8420
   curl -H "Authorization: Bearer <KEY>" http://localhost:8420/api/v1/status
   curl http://localhost:8420/docs  # Swagger
 """
@@ -107,11 +109,19 @@ def get_serial() -> str:
 
 
 def detect_role() -> str:
-    """Detect if this is rpi1 or rpi2 based on installed scripts."""
+    """Detect if this is rpi1 or rpi2."""
     if Path("/usr/local/bin/cryoss-backup.sh").exists():
         return "rpi1"
-    if Path("/usr/local/bin/cryoss-repl-check.sh").exists():
+    if Path("/etc/cryoss/rpi2-role").exists():
         return "rpi2"
+    # Fallback: check interco IP
+    try:
+        import subprocess
+        r = subprocess.run("ip addr show 2>/dev/null | grep -q 10.42.0.2", shell=True)
+        if r.returncode == 0:
+            return "rpi2"
+    except:
+        pass
     return "unknown"
 
 
@@ -190,13 +200,13 @@ def rate_limit(request: Request) -> None:
     # Clean old entries for this client
     _rate_store[client] = [t for t in _rate_store[client] if now - t < RATE_LIMIT_WINDOW]
 
-    # Periodic cleanup: remove stale clients (every 100 requests)
+    # Periodic cleanup: remove stale clients (every 100 requests), never the current client
     if sum(len(v) for v in _rate_store.values()) % 100 == 0:
-        stale = [k for k, v in _rate_store.items() if not v or now - max(v) > RATE_LIMIT_WINDOW * 2]
+        stale = [k for k, v in _rate_store.items() if k != client and (not v or now - max(v) > RATE_LIMIT_WINDOW * 2)]
         for k in stale:
             del _rate_store[k]
 
-    if len(_rate_store[client]) >= RATE_LIMIT_MAX:
+    if len(_rate_store.get(client, [])) >= RATE_LIMIT_MAX:
         raise HTTPException(429, f"Rate limit: max {RATE_LIMIT_MAX} req/{RATE_LIMIT_WINDOW}s")
 
     _rate_store[client].append(now)
@@ -298,7 +308,7 @@ def status(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
 
     # Cryoss-specific services
     for s in ["cryoss-backup.timer", "cryoss-health-daily.timer",
-              "cryoss-watchdog.timer", "cryoss-api", "cryoss-tunnel"]:
+              "cryoss-watchdog.timer", "cryoss-api", "cryoss-heartbeat.timer"]:
         state = sh_val(f"systemctl is-active {s}")
         if state != "N/A":
             services[s] = state
@@ -414,10 +424,10 @@ def backup_history(
 
 @app.get("/api/v1/backup/archives")
 def backup_archives(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
-    """Liste des archives chiffrées locales (.cbc.enc)."""
+    """Liste des archives chiffrées locales (rclone crypt)."""
     return make_response({
-        "cbc": sh("ls -lhrt /etc/encrypted/*.cbc.enc 2>/dev/null | tail -30"),
-        "count": sh_val("ls /etc/encrypted/*.cbc.enc 2>/dev/null | wc -l", "0"),
+        "files": sh("ls -lhrt /etc/encrypted/ 2>/dev/null | tail -30"),
+        "count": sh_val("find /etc/encrypted -maxdepth 2 -type f 2>/dev/null | wc -l", "0"),
         "total_size": sh_val("du -sh /etc/encrypted/ 2>/dev/null | awk '{print $1}'"),
     })
 
@@ -452,20 +462,30 @@ def replication_status(serial: str = Depends(verify_auth), _=Depends(rate_limit)
         # Vérifie depuis RPi1 : les fichiers sur RPi2
         return make_response({
             "rpi2_reachable": sh(f"ssh -o BatchMode=yes -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'echo ok' 2>/dev/null")["ok"],
-            "rpi2_latest": sh(f"ssh -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'ls -lt /etc/encrypted/rpi1/*.enc 2>/dev/null | head -5'"),
-            "rpi2_count": sh_val(f"ssh -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'ls /etc/encrypted/rpi1/*.enc 2>/dev/null | wc -l'"),
+            "rpi2_latest": sh(f"ssh -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'ls -lt /etc/encrypted/rpi1/ 2>/dev/null | head -5'"),
+            "rpi2_count": sh_val(f"ssh -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'find /etc/encrypted/rpi1 -type f 2>/dev/null | wc -l'"),
             "rpi2_disk": sh(f"ssh -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'df -h /etc/encrypted'"),
         })
     else:
         # RPi2 : montre la réception locale
+        newest_ts = sh_val(
+            "find /etc/encrypted/rpi1 -type f -printf '%T@\\n' 2>/dev/null | sort -rn | head -1"
+        )
+        age_h = None
+        if newest_ts:
+            try:
+                import time
+                age_s = time.time() - float(newest_ts)
+                if 0 <= age_s < 31536000:  # < 1 an = valeur raisonnable
+                    age_h = round(age_s / 3600, 1)
+            except (ValueError, TypeError):
+                pass
         return make_response({
-            "latest": sh("ls -lt /etc/encrypted/rpi1/*.enc 2>/dev/null | head -10"),
-            "count": sh_val("ls /etc/encrypted/rpi1/*.enc 2>/dev/null | wc -l"),
+            "latest": sh("ls -lt /etc/encrypted/rpi1/ 2>/dev/null | head -10"),
+            "file_count": sh_val("find /etc/encrypted/rpi1 -type f 2>/dev/null | wc -l"),
             "disk": sh("df -h /etc/encrypted"),
-            "last_file_age": sh_val(
-                "stat -c '%Y' $(ls -t /etc/encrypted/rpi1/*.enc 2>/dev/null | head -1) 2>/dev/null"
-                " | awk -v now=$(date +%s) '{printf \"%.1f hours\", (now-$1)/3600}'"
-            ),
+            "last_received_age_h": age_h,
+            "last_received_ts": int(float(newest_ts)) if newest_ts else None,
         })
 
 
@@ -611,8 +631,8 @@ def rpi2_status(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
         "services": sh(f"{base} 'systemctl is-active ssh fail2ban'"),
         "uptime": sh_val(f"{base} 'uptime -p'"),
         "temp": sh_val(f"{base} \"awk '{{printf \\\"%.1f\\\", \\$1/1000}}' /sys/class/thermal/thermal_zone0/temp\""),
-        "reception": sh(f"{base} 'ls -lt /etc/encrypted/rpi1/*.enc 2>/dev/null | head -10'"),
-        "reception_count": sh_val(f"{base} 'ls /etc/encrypted/rpi1/*.enc 2>/dev/null | wc -l'"),
+        "reception": sh(f"{base} 'ls -lt /etc/encrypted/rpi1/ 2>/dev/null | head -10'"),
+        "reception_count": sh_val(f"{base} 'find /etc/encrypted/rpi1 -type f 2>/dev/null | wc -l'"),
     })
 
 
@@ -652,17 +672,26 @@ def rpi2_logs(
 
 
 # ============================================================================
-# Routes : Tunnel
+# Routes : Heartbeat (phone-home vers Analyss)
 # ============================================================================
 
 
-@app.get("/api/v1/tunnel/status")
-def tunnel_status(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
-    """Status du tunnel SSH inverse."""
+@app.get("/api/v1/heartbeat/status")
+def heartbeat_status(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
+    """Status du heartbeat vers Analyss."""
+    conf_file = Path("/etc/cryoss/analyss.conf")
+    log_file = Path("/var/log/cryoss-heartbeat.log")
+
+    configured = conf_file.exists()
+    last_line = ""
+    if log_file.exists():
+        last_line = sh_val(f"tail -1 {log_file}")
+
     return make_response({
-        "service": sh("systemctl show cryoss-tunnel --property=ActiveState,SubState,MainPID --no-pager"),
-        "active": sh_val("systemctl is-active cryoss-tunnel") == "active",
-        "connections": sh("ss -tnp | grep autossh 2>/dev/null || ss -tnp | grep 'ssh.*-R' 2>/dev/null"),
+        "configured": configured,
+        "timer_active": sh_val("systemctl is-active cryoss-heartbeat.timer") == "active",
+        "last_heartbeat": last_line,
+        "analyss_url": sh_val("grep ANALYSS_URL /etc/cryoss/analyss.conf 2>/dev/null | cut -d'\"' -f2") if configured else None,
     })
 
 
@@ -673,12 +702,11 @@ def tunnel_status(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
 
 @app.get("/api/v1/serial")
 def serial_info(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
-    """Informations sur le numéro de série et les ports tunnel."""
-    serial_val = get_serial()
+    """Informations sur le numéro de série."""
     return make_response({
-        "serial": serial_val,
-        "tunnel_ssh_port": sh_val(f"/usr/local/bin/cryoss-serial.sh port"),
-        "tunnel_api_port": sh_val(f"/usr/local/bin/cryoss-serial.sh api-port"),
+        "serial": get_serial(),
+        "role": detect_role(),
+        "hostname": socket.gethostname(),
     })
 
 
