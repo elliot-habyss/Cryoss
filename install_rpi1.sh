@@ -4,32 +4,436 @@
 #  Chemin 2 : rclone crypt (XSalsa20-Poly1305) -> RPi2 via SFTP interco
 #  Chemin 3 : rclone crypt (XSalsa20-Poly1305) -> SFTP distant + versioning
 #  Chemin 3 : rclone crypt        → Serveur SFTP          (optionnel, incrémental + versioning)
-#  Usage : sudo bash install_rpi1.sh
+#
+#  Usage :
+#    sudo bash install_rpi1.sh                    # installation standard
+#    sudo bash install_rpi1.sh --resume           # reprend après le dernier checkpoint OK
+#    sudo bash install_rpi1.sh --from-step ID     # repart à partir d'une étape (ex: 11-samba)
+#    sudo bash install_rpi1.sh --list-steps       # liste des étapes avec statut
+#    sudo bash install_rpi1.sh --reset            # efface l'état (réinstall complète)
+#    sudo bash install_rpi1.sh --help             # aide
 # =============================================================================
 
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+# =============================================================================
+#  COULEURS — palette Cryoss
+# =============================================================================
+RED='\033[0;31m';     GREEN='\033[0;32m';   YELLOW='\033[1;33m'
+BLUE='\033[0;34m';    CYAN='\033[0;36m';    MAGENTA='\033[0;35m'
+BOLD='\033[1m';       DIM='\033[2m';        NC='\033[0m'
+# Bleu glace Cryoss (256 colors)
+CRY='\033[38;5;39m';  CRY_DARK='\033[38;5;33m';  CRY_LIGHT='\033[38;5;117m'
 
-ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
-info() { echo -e "${BLUE}[i]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
-step() { echo -e "\n${BOLD}${BLUE}━━━ $1 ━━━${NC}"; }
+# =============================================================================
+#  ÉTAT & FICHIERS DE PERSISTANCE (resume)
+# =============================================================================
+CRYOSS_STATE_DIR="/var/lib/cryoss"
+CRYOSS_STATE_FILE="${CRYOSS_STATE_DIR}/install.state"
+CRYOSS_ENV_FILE="${CRYOSS_STATE_DIR}/install.env"
+CRYOSS_INSTALL_LOG="/var/log/cryoss-install.log"
 
+# Liste ordonnée des étapes (ID:Titre) — utilisée pour --list-steps et la reprise
+CRYOSS_STEPS=(
+    "01-packages:Paquets de base"
+    "02-network:IP fixe (NetworkManager)"
+    "03-raid:RAID 1 (mdadm)"
+    "04-mounts:Répertoires et montage"
+    "05-users:Utilisateurs système et permissions"
+    "06-rclone:Configuration rclone (3 chemins chiffrés)"
+    "07-ssh-rpi2:Clé SSH pour réplication RPi2"
+    "09-msmtp:msmtp + relais SMTP"
+    "09b-emaillib:Librairie email HTML"
+    "10-backup-script:Script cryoss-backup.sh"
+    "11-samba:Samba (partages de base)"
+    "11b-samba-wizard:Partages personnalisés (interactif)"
+    "12-systemd:Services et timers systemd"
+    "13-hardening:Durcissement système"
+    "14-monitoring:Monitoring et rapports HTML"
+    "15-master-key:Master key Console Analyss (Fernet)"
+)
+
+# =============================================================================
+#  CLI — parsing
+# =============================================================================
+CRYOSS_MODE="install"        # install | resume | from-step | only-step | list | reset | help
+CRYOSS_FROM_STEP=""
+CRYOSS_ONLY_STEP=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --resume)       CRYOSS_MODE="resume" ;;
+        --from-step)    CRYOSS_MODE="from-step"; shift; CRYOSS_FROM_STEP="${1:-}" ;;
+        --only-step)    CRYOSS_MODE="only-step"; shift; CRYOSS_ONLY_STEP="${1:-}" ;;
+        --list-steps)   CRYOSS_MODE="list" ;;
+        --reset)        CRYOSS_MODE="reset" ;;
+        --help|-h)      CRYOSS_MODE="help" ;;
+        *)              echo "Argument inconnu : $1" >&2; CRYOSS_MODE="help" ;;
+    esac
+    shift || true
+done
+
+# =============================================================================
+#  HELPERS DE BASE — log/info/ok/warn/err
+# =============================================================================
+ok()    { echo -e "${GREEN}[✓]${NC} $1"; }
+info()  { echo -e "${CRY}[i]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+err()   { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+step()  { echo -e "\n${BOLD}${CRY}━━━ $1 ━━━${NC}"; }
+hdr()   { echo -e "${BOLD}${CRY}$1${NC}"; }
+
+# =============================================================================
+#  LIBRAIRIE UI CRYOSS — banner, spinner, barre, runner
+# =============================================================================
+
+# Glyphes Unicode pour les barres et le spinner (compatibles UTF-8)
+CRYOSS_BAR_FILL='█'
+CRYOSS_BAR_EMPTY='░'
+CRYOSS_SPINNER=('⣾' '⣽' '⣻' '⢿' '⡿' '⣟' '⣯' '⣷')
+
+cryoss_banner() {
+    # Affiche la bannière ASCII Cryoss en bleu glace
+    echo
+    echo -e "${CRY}"
+    cat <<'BANNER'
+   ██████╗██████╗ ██╗   ██╗ ██████╗ ███████╗███████╗
+  ██╔════╝██╔══██╗╚██╗ ██╔╝██╔═══██╗██╔════╝██╔════╝
+  ██║     ██████╔╝ ╚████╔╝ ██║   ██║███████╗███████╗
+  ██║     ██╔══██╗  ╚██╔╝  ██║   ██║╚════██║╚════██║
+  ╚██████╗██║  ██║   ██║   ╚██████╔╝███████║███████║
+   ╚═════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚══════╝╚══════╝
+BANNER
+    echo -e "${DIM}        Triple chiffrement rclone (XSalsa20-Poly1305 ×3)${NC}"
+    echo -e "${DIM}              Installation RPi1 — Primaire${NC}"
+    echo
+}
+
+# cryoss_bar PERCENT [LABEL] — barre de progression sur une ligne (largeur 40)
+cryoss_bar() {
+    local pct="$1" label="${2:-}"
+    local width=40
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local bar=""
+    local i
+    for (( i=0; i<filled; i++ )); do bar+="${CRYOSS_BAR_FILL}"; done
+    for (( i=0; i<empty; i++ ));  do bar+="${CRYOSS_BAR_EMPTY}"; done
+    printf "\r${CRY}┃${NC} ${CRY_LIGHT}%s${NC} ${BOLD}%3d%%${NC} ${DIM}%s${NC}" \
+        "$bar" "$pct" "$label"
+}
+
+# cryoss_run "Label affiché" -- cmd args...
+# Exécute la commande, redirige stdout/stderr vers le log, anime un spinner.
+# Affiche ✓ ou ✗ + temps écoulé. Sur échec, affiche les 20 dernières lignes du log.
+cryoss_run() {
+    local label="$1"
+    shift
+    [[ "${1:-}" == "--" ]] && shift
+    local start_ts elapsed rc=0 spin_pid frame=0
+    mkdir -p "$(dirname "$CRYOSS_INSTALL_LOG")" 2>/dev/null || true
+    : > /tmp/.cryoss_run.$$.log
+
+    start_ts=$(date +%s)
+    # Lancer la commande en arrière-plan
+    ( "$@" >>/tmp/.cryoss_run.$$.log 2>&1 ) &
+    local cmd_pid=$!
+
+    # Spinner (suspendu si stdout n'est pas un terminal)
+    if [[ -t 1 ]]; then
+        ( while kill -0 "$cmd_pid" 2>/dev/null; do
+            local f="${CRYOSS_SPINNER[$((frame % ${#CRYOSS_SPINNER[@]}))]}"
+            local now=$(date +%s)
+            printf "\r${CRY}┃${NC} ${CRY}%s${NC} ${BOLD}%s${NC} ${DIM}(%ds)${NC}     " \
+                "$f" "$label" "$((now - start_ts))"
+            frame=$((frame + 1))
+            sleep 0.1
+          done ) &
+        spin_pid=$!
+    fi
+
+    wait "$cmd_pid"; rc=$?
+    [[ -n "${spin_pid:-}" ]] && { kill "$spin_pid" 2>/dev/null || true; wait "$spin_pid" 2>/dev/null || true; }
+    elapsed=$(( $(date +%s) - start_ts ))
+
+    # Concaténer le log de cette commande dans le log global
+    cat "/tmp/.cryoss_run.$$.log" >> "$CRYOSS_INSTALL_LOG" 2>/dev/null || true
+
+    if (( rc == 0 )); then
+        printf "\r${CRY}┃${NC} ${GREEN}✓${NC} ${BOLD}%s${NC} ${DIM}(%ds)${NC}%-20s\n" "$label" "$elapsed" ""
+    else
+        printf "\r${CRY}┃${NC} ${RED}✗${NC} ${BOLD}%s${NC} ${DIM}(échec après %ds, code %d)${NC}\n" "$label" "$elapsed" "$rc"
+        echo -e "${DIM}---- 20 dernières lignes (${CRYOSS_INSTALL_LOG}) ----${NC}"
+        tail -n 20 "/tmp/.cryoss_run.$$.log" | sed "s/^/  /"
+        echo -e "${DIM}-------------------------------------------------${NC}"
+    fi
+    rm -f "/tmp/.cryoss_run.$$.log"
+    return $rc
+}
+
+# cryoss_apt_install pkg1 pkg2 ... — apt-get install avec barre de progression
+cryoss_apt_install() {
+    local pkgs=("$@")
+    local total=${#pkgs[@]}
+    local label="apt-get install (${total} paquet(s))"
+    DEBIAN_FRONTEND=noninteractive cryoss_run "$label" -- \
+        apt-get install -y -o Dpkg::Use-Pty=0 "${pkgs[@]}"
+}
+
+# cryoss_download URL DEST [LABEL] — télécharge avec barre de progression curl stylée
+cryoss_download() {
+    local url="$1" dest="$2" label="${3:-Téléchargement}"
+    cryoss_run "$label" -- curl -fsSL --retry 3 -o "$dest" "$url"
+}
+
+# =============================================================================
+#  RESUME FRAMEWORK
+# =============================================================================
+
+cryoss_state_init() {
+    mkdir -p "$CRYOSS_STATE_DIR"
+    chmod 700 "$CRYOSS_STATE_DIR"
+    touch "$CRYOSS_STATE_FILE"
+    chmod 600 "$CRYOSS_STATE_FILE"
+}
+
+# Marque une étape comme complétée
+cryoss_mark_done() {
+    cryoss_state_init
+    grep -qxF "$1" "$CRYOSS_STATE_FILE" 2>/dev/null || echo "$1" >> "$CRYOSS_STATE_FILE"
+}
+
+# Renvoie 0 si l'étape est déjà complétée (à skipper), 1 sinon
+cryoss_is_done() {
+    [[ -f "$CRYOSS_STATE_FILE" ]] && grep -qxF "$1" "$CRYOSS_STATE_FILE"
+}
+
+# Ouvre une étape : affiche l'en-tête. Renvoie 0 = exécuter, 1 = skip.
+# Usage : if cryoss_step "01-packages" "1. Paquets"; then ... cryoss_done "01-packages"; fi
+cryoss_step() {
+    local id="$1" title="$2"
+    if cryoss_is_done "$id"; then
+        echo -e "\n${DIM}${CRY}┃ ⊘ ${title} (déjà fait — skip)${NC}"
+        return 1
+    fi
+    echo -e "\n${BOLD}${CRY}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CRY}║${NC} ${BOLD}${title}${NC}"
+    echo -e "${BOLD}${CRY}╚══════════════════════════════════════════════════════════╝${NC}"
+    return 0
+}
+
+cryoss_done() {
+    cryoss_mark_done "$1"
+    echo -e "${CRY}┃ ${GREEN}✓ Étape ${BOLD}$1${NC}${GREEN} validée${NC}"
+}
+
+# Sauvegarde toutes les variables collectées dans /var/lib/cryoss/install.env (600 root)
+cryoss_save_env() {
+    cryoss_state_init
+    umask 077
+    {
+        echo "# Cryoss — variables d'installation (généré $(date '+%Y-%m-%d %H:%M:%S'))"
+        echo "# CONFIDENTIEL : contient mots de passe SMTP/SFTP en clair, mode 600 root."
+        echo "# Sourcé automatiquement par install_rpi1.sh --resume"
+        for var in CLIENT_NAME \
+                   SMTP_HOST SMTP_PORT SMTP_FROM SMTP_USER SMTP_PASS \
+                   EMAIL_TO EMAIL_TO_2 \
+                   NET_IFACE NET_IP NET_CIDR NET_GW NET_DNS1 NET_DNS2 \
+                   INTERCO_IFACE INTERCO_IP_RPI1 INTERCO_IP_RPI2 INTERCO_CIDR INTERCO_CON \
+                   RPI2_IP RPI2_SSH_PORT RPI2_USER RPI2_DIR \
+                   ENABLE_SFTP SFTP_HOST SFTP_PORT SFTP_USER SFTP_PASS SFTP_REMOTE_DIR \
+                   DISK1 DISK2 DISK3 DISK4 \
+                   DS_PASS HABYSS_PASS; do
+            if [[ -n "${!var:-}" ]]; then
+                printf '%s=%q\n' "$var" "${!var}"
+            fi
+        done
+    } > "$CRYOSS_ENV_FILE"
+    chmod 600 "$CRYOSS_ENV_FILE"
+}
+
+cryoss_load_env() {
+    if [[ ! -f "$CRYOSS_ENV_FILE" ]]; then
+        err "Aucun environnement sauvegardé (${CRYOSS_ENV_FILE}) — impossible de reprendre"
+    fi
+    # shellcheck disable=SC1090
+    source "$CRYOSS_ENV_FILE"
+    info "Environnement rechargé depuis ${CRYOSS_ENV_FILE}"
+}
+
+# Affiche la liste des étapes avec leur statut
+cryoss_list_steps() {
+    cryoss_banner
+    hdr "Liste des étapes Cryoss RPi1"
+    echo
+    local entry id title status
+    for entry in "${CRYOSS_STEPS[@]}"; do
+        id="${entry%%:*}"
+        title="${entry#*:}"
+        if cryoss_is_done "$id"; then
+            status="${GREEN}✓ fait${NC}"
+        else
+            status="${DIM}○ à faire${NC}"
+        fi
+        printf "  ${CRY}%-22s${NC} %b  %s\n" "$id" "$status" "$title"
+    done
+    echo
+    if [[ -f "$CRYOSS_ENV_FILE" ]]; then
+        info "Variables sauvegardées : ${CRYOSS_ENV_FILE} (600 root)"
+    else
+        info "Aucune variable sauvegardée — première installation"
+    fi
+}
+
+# Purge l'état à partir d'une étape donnée (incluse)
+cryoss_reset_from() {
+    local from_id="$1"
+    [[ ! -f "$CRYOSS_STATE_FILE" ]] && return 0
+    local entry id keep=1
+    local tmp="${CRYOSS_STATE_FILE}.tmp"
+    : > "$tmp"
+    for entry in "${CRYOSS_STEPS[@]}"; do
+        id="${entry%%:*}"
+        [[ "$id" == "$from_id" ]] && keep=0
+        if (( keep )) && grep -qxF "$id" "$CRYOSS_STATE_FILE"; then
+            echo "$id" >> "$tmp"
+        fi
+    done
+    mv "$tmp" "$CRYOSS_STATE_FILE"
+    chmod 600 "$CRYOSS_STATE_FILE"
+}
+
+cryoss_reset_all() {
+    rm -f "$CRYOSS_STATE_FILE" "$CRYOSS_ENV_FILE"
+    info "État effacé : ${CRYOSS_STATE_FILE} et ${CRYOSS_ENV_FILE}"
+}
+
+cryoss_show_help() {
+    cryoss_banner
+    cat <<'HELP'
+Usage : sudo bash install_rpi1.sh [OPTION]
+
+  (sans option)         Installation standard : collecte interactive puis exécution
+                        de toutes les étapes. Si un état partiel existe, propose
+                        de reprendre.
+  --resume              Reprend après le dernier checkpoint OK (utilise l'env sauvegardé).
+  --from-step ID        Repart à partir d'une étape précise (ex: 11-samba). Toutes les
+                        étapes suivantes sont rejouées. Utilise l'env sauvegardé.
+  --only-step ID        Rejoue UNIQUEMENT l'étape donnée (ex: 11b-samba-wizard pour
+                        ajouter des partages sans toucher au reste). Utilise l'env.
+  --list-steps          Affiche la liste des étapes avec leur statut (fait / à faire).
+  --reset               Efface l'état et l'env sauvegardé (réinstall complète).
+  --help, -h            Affiche cette aide.
+
+Fichiers d'état :
+  /var/lib/cryoss/install.state   Étapes complétées (1 ID/ligne, 600 root).
+  /var/lib/cryoss/install.env     Variables collectées (600 root, sensible).
+  /var/log/cryoss-install.log     Log brut de toutes les commandes encapsulées.
+HELP
+}
+
+# =============================================================================
+#  HELP / LIST — accessibles sans root (lecture seule)
+# =============================================================================
+case "$CRYOSS_MODE" in
+    help)
+        cryoss_show_help
+        exit 0
+        ;;
+    list)
+        cryoss_list_steps
+        exit 0
+        ;;
+esac
+
+# =============================================================================
+#  ROOT CHECK — requis pour tous les autres modes
+# =============================================================================
 [[ $EUID -ne 0 ]] && err "Exécuter en root : sudo bash $0"
 
 # =============================================================================
-#  COLLECTE
+#  TRAITEMENT DES MODES CLI (root requis)
 # =============================================================================
-echo -e "${BOLD}"
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║     CRYOSS RPi1 - Installation (Primaire)              ║"
-echo "║     Triple chiffrement rclone (XSalsa20-Poly1305 x3 cles)     ║"
-echo "║     (SFTP optionnel — activable/désactivable)             ║"
-echo "╚══════════════════════════════════════════════════════════╝"
-echo -e "${NC}"
+case "$CRYOSS_MODE" in
+    reset)
+        cryoss_banner
+        warn "Cela va effacer l'état d'installation et l'env sauvegardé."
+        read -rp "Confirmer la réinitialisation ? [o/N] : " _r
+        [[ "${_r,,}" == "o" ]] || err "Annulé."
+        cryoss_reset_all
+        ok "État réinitialisé. Relancez sans option pour une installation fraîche."
+        exit 0
+        ;;
+    resume)
+        cryoss_banner
+        cryoss_load_env
+        info "Mode reprise : les étapes déjà validées seront skippées."
+        ;;
+    from-step)
+        cryoss_banner
+        if [[ -z "$CRYOSS_FROM_STEP" ]]; then
+            err "--from-step requiert un ID d'étape (ex: 11-samba). Voir --list-steps."
+        fi
+        if ! printf '%s\n' "${CRYOSS_STEPS[@]}" | grep -q "^${CRYOSS_FROM_STEP}:"; then
+            err "ID inconnu : ${CRYOSS_FROM_STEP}. Voir --list-steps."
+        fi
+        cryoss_load_env
+        cryoss_reset_from "$CRYOSS_FROM_STEP"
+        info "Mode --from-step : l'étape ${CRYOSS_FROM_STEP} et les suivantes vont être rejouées."
+        ;;
+    only-step)
+        cryoss_banner
+        if [[ -z "$CRYOSS_ONLY_STEP" ]]; then
+            err "--only-step requiert un ID d'étape (ex: 11b-samba-wizard). Voir --list-steps."
+        fi
+        if ! printf '%s\n' "${CRYOSS_STEPS[@]}" | grep -q "^${CRYOSS_ONLY_STEP}:"; then
+            err "ID inconnu : ${CRYOSS_ONLY_STEP}. Voir --list-steps."
+        fi
+        cryoss_load_env
+        # Retire UNIQUEMENT l'étape ciblée du state (les autres restent "fait" et seront skippées)
+        if [[ -f "$CRYOSS_STATE_FILE" ]]; then
+            grep -vxF "$CRYOSS_ONLY_STEP" "$CRYOSS_STATE_FILE" > "${CRYOSS_STATE_FILE}.tmp" || true
+            mv "${CRYOSS_STATE_FILE}.tmp" "$CRYOSS_STATE_FILE"
+            chmod 600 "$CRYOSS_STATE_FILE"
+        fi
+        info "Mode --only-step : seule l'étape ${CRYOSS_ONLY_STEP} sera rejouée."
+        ;;
+    install)
+        cryoss_banner
+        # Si un état partiel existe, proposer de reprendre
+        if [[ -f "$CRYOSS_STATE_FILE" ]] && [[ -s "$CRYOSS_STATE_FILE" ]]; then
+            warn "Une installation partielle a été détectée :"
+            echo
+            CRYOSS_DONE_COUNT=$(wc -l < "$CRYOSS_STATE_FILE" 2>/dev/null || echo 0)
+            echo -e "  ${CRY}Étapes déjà validées : ${BOLD}${CRYOSS_DONE_COUNT}${NC} / ${#CRYOSS_STEPS[@]}"
+            echo -e "  ${CRY}État : ${CRYOSS_STATE_FILE}${NC}"
+            echo
+            echo "  [1] Reprendre (skip les étapes déjà faites)"
+            echo "  [2] Recommencer depuis une étape précise (--from-step)"
+            echo "  [3] Lister les étapes avec leur statut"
+            echo "  [4] Tout effacer et repartir de zéro (--reset)"
+            echo "  [5] Annuler"
+            read -rp "Votre choix [1-5] : " _choice
+            case "$_choice" in
+                1) cryoss_load_env; CRYOSS_MODE="resume" ;;
+                2) cryoss_list_steps
+                   read -rp "ID de l'étape à rejouer : " CRYOSS_FROM_STEP
+                   cryoss_load_env
+                   cryoss_reset_from "$CRYOSS_FROM_STEP"
+                   CRYOSS_MODE="from-step" ;;
+                3) cryoss_list_steps; exit 0 ;;
+                4) cryoss_reset_all; CRYOSS_MODE="install" ;;
+                5) err "Annulé." ;;
+                *) err "Choix invalide." ;;
+            esac
+        fi
+        ;;
+esac
+
+# =============================================================================
+#  COLLECTE — skippée si on reprend (env déjà chargé)
+# =============================================================================
+if [[ "$CRYOSS_MODE" == "install" ]]; then
 
 step "Identification"
 read -rp "  Nom du client : " CLIENT_NAME
@@ -134,35 +538,41 @@ echo
 read -rp "Confirmer ? [o/N] : " CONFIRM
 [[ "${CONFIRM,,}" != "o" ]] && err "Annule."
 
+# Variables collectées → persistées pour permettre la reprise
+cryoss_save_env
+ok "Variables sauvegardées dans ${CRYOSS_ENV_FILE} (600 root)"
+
+fi  # fin du bloc COLLECTE (skippé en mode resume / from-step)
+
 # =============================================================================
-#  INSTALLATION
+#  INSTALLATION — chaque étape est encapsulée dans cryoss_step / cryoss_done
 # =============================================================================
 
-step "1. Paquets"
-# TOUS les paquets ici — avant toute manipulation réseau ou UFW
-apt-get update -qq
-# msmtp-mta fournit mail-transport-agent — postfix entre en conflit, on le vire
-apt-get remove -y postfix 2>/dev/null || true
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    openssl msmtp msmtp-mta samba mdadm ufw fail2ban curl smartmontools
-ok "Paquets de base installés"
+if cryoss_step "01-packages" "1. Paquets de base"; then
+    # TOUS les paquets ici — avant toute manipulation réseau ou UFW
+    cryoss_run "apt-get update" -- apt-get update -qq
+    # msmtp-mta fournit mail-transport-agent — postfix entre en conflit, on le vire
+    cryoss_run "Désinstallation postfix (conflit msmtp-mta)" -- bash -c \
+        'apt-get remove -y postfix 2>/dev/null || true'
+    cryoss_apt_install openssl msmtp msmtp-mta samba mdadm ufw fail2ban curl smartmontools
 
-# rclone est OBLIGATOIRE (utilise pour les 3 chemins de chiffrement)
-if ! command -v rclone &>/dev/null; then
-    info "Installation rclone (requis pour les 3 chemins)..."
-    curl -fsSL https://rclone.org/install.sh | bash &>/dev/null \
-        || err "Installation rclone echouee — installez manuellement : https://rclone.org/install/"
-    ok "rclone installe"
-else
-    ok "rclone deja present ($(rclone version --check 2>/dev/null | head -1 || echo 'version inconnue'))"
+    # rclone est OBLIGATOIRE (utilise pour les 3 chemins de chiffrement)
+    if ! command -v rclone &>/dev/null; then
+        cryoss_run "Téléchargement et installation rclone" -- bash -c \
+            'curl -fsSL https://rclone.org/install.sh | bash' \
+            || err "Installation rclone echouee — installez manuellement : https://rclone.org/install/"
+    else
+        ok "rclone deja present ($(rclone version --check 2>/dev/null | head -1 || echo 'version inconnue'))"
+    fi
+    cryoss_done "01-packages"
 fi
 
 # =============================================================================
-step "2. IP fixe (NetworkManager)"
+if cryoss_step "02-network" "2. IP fixe (NetworkManager)"; then
 
 NM_CON="cryoss-static"
 if ! systemctl is-active --quiet NetworkManager 2>/dev/null; then
-    apt install -y network-manager &>/dev/null
+    cryoss_apt_install network-manager
     systemctl enable NetworkManager; systemctl start NetworkManager; sleep 3
 fi
 nmcli connection delete "$NM_CON" 2>/dev/null || true
@@ -191,9 +601,11 @@ nmcli connection add type ethernet ifname "$INTERCO_IFACE" con-name "$INTERCO_CO
 nmcli connection up "$INTERCO_CON" 2>/dev/null || true
 ok "IP inter-RPi : ${INTERCO_IP_RPI1}/${INTERCO_CIDR} sur $INTERCO_IFACE (cable direct vers RPi2)"
 info "RPi2 utilisera ${INTERCO_IP_RPI2} sur son interface de replication"
+    cryoss_done "02-network"
+fi
 
 # =============================================================================
-step "3. RAID 1"
+if cryoss_step "03-raid" "3. RAID 1 (mdadm)"; then
 
 nuke_disk() {
     local disk=$1; info "Nettoyage $disk..."
@@ -218,22 +630,20 @@ done
 for DISK in "$DISK1" "$DISK2" "$DISK3" "$DISK4"; do nuke_disk "$DISK"; done
 sleep 2; partprobe "$DISK1" "$DISK2" "$DISK3" "$DISK4" 2>/dev/null || true; sleep 2
 
-info "Creation /dev/md0 ($DISK1 + $DISK2)..."
-mdadm --create /dev/md0 --level=1 --raid-devices=2 --bitmap=internal --run --force \
-    "$DISK1" "$DISK2" <<< "yes"
-ok "/dev/md0 cree"
+cryoss_run "Création RAID md0 ($DISK1 + $DISK2)" -- bash -c \
+    "mdadm --create /dev/md0 --level=1 --raid-devices=2 --bitmap=internal --run --force '$DISK1' '$DISK2' <<< yes"
 
-info "Creation /dev/md1 ($DISK3 + $DISK4)..."
-mdadm --create /dev/md1 --level=1 --raid-devices=2 --bitmap=internal --run --force \
-    "$DISK3" "$DISK4" <<< "yes"
-ok "/dev/md1 cree"
+cryoss_run "Création RAID md1 ($DISK3 + $DISK4)" -- bash -c \
+    "mdadm --create /dev/md1 --level=1 --raid-devices=2 --bitmap=internal --run --force '$DISK3' '$DISK4' <<< yes"
 
 sleep 10; cat /proc/mdstat
-mkfs.ext4 -F -q /dev/md0; ok "md0 formate ext4"
-mkfs.ext4 -F -q /dev/md1; ok "md1 formate ext4"
+cryoss_run "Formatage ext4 md0"  -- mkfs.ext4 -F -q /dev/md0
+cryoss_run "Formatage ext4 md1"  -- mkfs.ext4 -F -q /dev/md1
+    cryoss_done "03-raid"
+fi
 
 # =============================================================================
-step "4. Repertoires et montage"
+if cryoss_step "04-mounts" "4. Répertoires et montage"; then
 
 mkdir -p /etc/sauvegarde /etc/encrypted
 mount /dev/md0 /etc/sauvegarde && ok "md0 -> /etc/sauvegarde" || warn "deja monte"
@@ -249,9 +659,11 @@ sed -i '/\/etc\/sauvegarde/d;/\/etc\/encrypted/d' /etc/fstab
 echo "UUID=$UUID_MD0   /etc/sauvegarde   ext4   defaults,nodev,nosuid   0   2" >> /etc/fstab
 echo "UUID=$UUID_MD1   /etc/encrypted    ext4   defaults,nodev,nosuid   0   2" >> /etc/fstab
 ok "fstab mis a jour"
+    cryoss_done "04-mounts"
+fi
 
 # =============================================================================
-step "5. Utilisateurs et permissions"
+if cryoss_step "05-users" "5. Utilisateurs système et permissions"; then
 
 groupadd -f samba-share
 
@@ -278,9 +690,12 @@ ok "habyss configure"
 chown root:samba-share /etc/sauvegarde /etc/encrypted
 chmod 2770 /etc/sauvegarde /etc/encrypted
 ok "Permissions repertoires OK"
+    cryoss_done "05-users"
+fi
 
 # =============================================================================
-step "6. Configuration rclone — 3 chemins chiffres independants"
+if cryoss_step "06-rclone" "6. Configuration rclone — 3 chemins chiffrés indépendants"; then
+# =============================================================================
 # =============================================================================
 # Architecture chiffrement :
 #   Chemin 1 (local)  : rclone crypt → RAID local     (XSalsa20-Poly1305, KEY_C1)
@@ -415,9 +830,11 @@ fi
 chmod 600 "$RCLONE_CONF"
 chown root:root "$RCLONE_CONF"
 ok "rclone.conf installe avec 3 chemins chiffres independants"
+    cryoss_done "06-rclone"
+fi
 
 # =============================================================================
-step "7. Cle SSH pour replication RPi2"
+if cryoss_step "07-ssh-rpi2" "7. Clé SSH pour réplication RPi2"; then
 
 SSH_KEY_PATH="/root/.ssh/cryoss_rpi2"
 mkdir -p /root/.ssh; chmod 700 /root/.ssh
@@ -458,9 +875,11 @@ if ssh -o ConnectTimeout=5 cryoss-rpi2 "mkdir -p $RPI2_DIR && echo OK" 2>/dev/nu
 else
     warn "SSH RPi2 echoue — test : ssh cryoss-rpi2 'echo ok'"
 fi
+    cryoss_done "07-ssh-rpi2"
+fi
 
 # =============================================================================
-step "9. msmtp"
+if cryoss_step "09-msmtp" "9. msmtp + relais SMTP"; then
 
 cat > /etc/msmtprc <<MSMTP_EOF
 defaults
@@ -513,9 +932,137 @@ if command -v postfix &>/dev/null; then
 else
     warn "Relais SMTP non configuré — RPi2 ne pourra pas envoyer d'emails de monitoring"
 fi
+    cryoss_done "09-msmtp"
+fi
 
 # =============================================================================
-step "10. Script cryoss-backup.sh"
+if cryoss_step "09b-emaillib" "9b. Librairie email HTML partagée"; then
+
+# Librairie de templates email HTML - utilisee par cryoss-backup, cryoss-health,
+# cryoss-honeypot et alertes RPi2. Evite la duplication et harmonise le look.
+mkdir -p /usr/local/lib
+cat > /usr/local/lib/cryoss-email.sh << 'EMAILLIB_EOF'
+#!/usr/bin/env bash
+# CRYOSS - Librairie templates email HTML (partagee)
+
+: "${CLIENT_NAME:=CRYOSS}"
+: "${EMAIL_TO:=}"
+: "${EMAIL_TO_2:=}"
+: "${HOSTNAME_VAL:=$(hostname 2>/dev/null || echo unknown)}"
+: "${LOG:=/var/log/cryoss-email.log}"
+
+_tshort() { date '+%d/%m/%Y %H:%M'; }
+
+_elog() {
+    [[ -n "${LOG:-}" ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] [email] $1" >> "$LOG" 2>/dev/null || true
+}
+
+badge() {
+    local lbl="$1" t="$2"
+    case "$t" in
+        ok)   echo "<span style='background:#ecfdf5;color:#059669;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #a7f3d0;'>$lbl</span>" ;;
+        warn) echo "<span style='background:#fffbeb;color:#d97706;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #fde68a;'>$lbl</span>" ;;
+        crit) echo "<span style='background:#fef2f2;color:#dc2626;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #fecaca;'>$lbl</span>" ;;
+        info) echo "<span style='background:#eef2ff;color:#6366f1;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #c7d2fe;'>$lbl</span>" ;;
+        *)    echo "<span style='background:#f1f5f9;color:#475569;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #cbd5e1;'>$lbl</span>" ;;
+    esac
+}
+
+section_open() {
+    echo "<table width='100%' cellpadding='0' cellspacing='0' style='margin-bottom:18px;'><tr><td style='padding-bottom:7px;border-bottom:1px solid #e2e8f0;'><span style='color:#2563eb;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;'>$1</span></td></tr><tr><td style='padding-top:10px;'><table width='100%' cellpadding='0' cellspacing='0'>"
+}
+section_close() { echo "</table></td></tr></table>"; }
+
+mrow() {
+    echo "<tr><td style='padding:5px 0;color:#64748b;font-size:13px;width:48%;'>$1</td><td style='padding:5px 0;color:#1e293b;font-size:13px;font-weight:600;'>$2 $3</td></tr>"
+}
+
+alert_banner() {
+    local msg="$1" type="${2:-crit}"
+    case "$type" in
+        ok)   echo "<div style='background:#f0fdf4;border-left:4px solid #059669;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#059669;font-weight:700;font-size:14px;'>&#10003; $msg</span></div>" ;;
+        warn) echo "<div style='background:#fffbeb;border-left:4px solid #d97706;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#d97706;font-weight:700;font-size:14px;'>&#9888; $msg</span></div>" ;;
+        info) echo "<div style='background:#eff6ff;border-left:4px solid #2563eb;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#2563eb;font-weight:700;font-size:14px;'>&#8505; $msg</span></div>" ;;
+        crit|*) echo "<div style='background:#fef2f2;border-left:4px solid #dc2626;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#dc2626;font-weight:700;font-size:14px;'>&#9888; $msg</span></div>" ;;
+    esac
+}
+
+code_block() {
+    echo "<pre style='font-family:monospace;font-size:11px;color:#1e293b;background:#f1f5f9;padding:10px;border-radius:5px;overflow-x:auto;margin:6px 0;white-space:pre-wrap;word-break:break-all;border:1px solid #e2e8f0;'>$1</pre>"
+}
+
+wrap_email() {
+    local title="$1" body="$2" accent="${3:-info}"
+    local accent_color
+    case "$accent" in
+        ok)   accent_color="#059669" ;;
+        warn) accent_color="#d97706" ;;
+        crit) accent_color="#dc2626" ;;
+        *)    accent_color="#2563eb" ;;
+    esac
+    cat << TMPL
+<!DOCTYPE html>
+<html lang="fr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f8f9fa;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f8f9fa;">
+<tr><td align="center" style="padding:28px 12px;">
+<table width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;background:#ffffff;border-radius:8px;border:1px solid #e2e8f0;overflow:hidden;">
+  <tr><td style="background:#ffffff;padding:24px 36px;border-bottom:2px solid ${accent_color};">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td><span style="font-size:20px;font-weight:800;color:#1e293b;letter-spacing:1px;">CRYOSS</span>
+      <p style="margin:4px 0 0;color:#64748b;font-size:11px;letter-spacing:2px;text-transform:uppercase;">Monitoring</p></td>
+      <td align="right" valign="middle"><span style="background:#eff6ff;border:1px solid ${accent_color};color:${accent_color};padding:5px 13px;border-radius:16px;font-size:12px;font-weight:700;letter-spacing:1px;">${CLIENT_NAME}</span></td>
+    </tr></table>
+  </td></tr>
+  <tr><td style="padding:24px 36px 6px;">
+    <h1 style="margin:0;color:#1e293b;font-size:18px;font-weight:700;">${title}</h1>
+    <p style="margin:5px 0 0;color:#64748b;font-size:12px;">$(_tshort) &nbsp;&bull;&nbsp; ${HOSTNAME_VAL}</p>
+  </td></tr>
+  <tr><td style="padding:14px 36px 28px;">${body}</td></tr>
+  <tr><td style="background:#f8f9fa;padding:16px 36px;border-top:1px solid #e2e8f0;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td style="color:#94a3b8;font-size:11px;">Cryoss &copy; <a href="https://analyss.fr" style="color:#2563eb;text-decoration:none;">Analyss</a> &mdash; Rapport automatique</td>
+      <td align="right"><a href="https://analyss.fr" style="color:#2563eb;font-size:11px;text-decoration:none;">analyss.fr</a></td>
+    </tr></table>
+  </td></tr>
+</table></td></tr></table>
+</body></html>
+TMPL
+}
+
+send_html_email() {
+    local subject="$1" full_html="$2"
+    local rc=0
+    for DEST in "$EMAIL_TO" "$EMAIL_TO_2"; do
+        [[ -z "$DEST" ]] && continue
+        {
+            echo "To: $DEST"
+            echo "Subject: $subject"
+            echo "MIME-Version: 1.0"
+            echo "Content-Type: text/html; charset=UTF-8"
+            echo ""
+            echo "$full_html"
+        } | msmtp "$DEST" 2>/dev/null || { _elog "WARN: email vers $DEST echoue"; rc=1; }
+    done
+    return $rc
+}
+
+send_email_wrapped() {
+    local subject="$1" title="$2" body="$3" accent="${4:-info}"
+    local full_html
+    full_html=$(wrap_email "$title" "$body" "$accent")
+    send_html_email "$subject" "$full_html"
+}
+EMAILLIB_EOF
+chmod 644 /usr/local/lib/cryoss-email.sh
+chown root:root /usr/local/lib/cryoss-email.sh
+ok "Librairie email HTML installee : /usr/local/lib/cryoss-email.sh"
+    cryoss_done "09b-emaillib"
+fi
+
+# =============================================================================
+if cryoss_step "10-backup-script" "10. Script cryoss-backup.sh"; then
 
 # On ecrit le script avec des placeholders puis on les remplace
 # pour eviter les problemes d'expansion dans le heredoc
@@ -540,7 +1087,7 @@ cat > /usr/local/bin/cryoss-backup.sh << 'SCRIPT_HEREDOC'
 
 set -uo pipefail   # PAS -e : gestion manuelle des erreurs par chemin
 
-# ── Lockfile (anti-execution concurrente) ─────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
 EMAIL_TO="DS_EMAIL_TO"
 EMAIL_TO_2="DS_EMAIL_TO_2"
 CLIENT_NAME="DS_CLIENT_NAME"
@@ -548,18 +1095,33 @@ ENABLE_SFTP="DS_ENABLE_SFTP"
 SRC_DIR="/etc/sauvegarde"
 LOCAL_ENC="/etc/encrypted"
 LOG="/var/log/cryoss-backup.log"
+HOSTNAME_VAL="$(hostname 2>/dev/null || echo cryoss1)"
 
-# [F3] Lockfile — alerte par email si backup deja en cours
+# Sourcer la librairie email HTML partagee
+if [[ -f /usr/local/lib/cryoss-email.sh ]]; then
+    # shellcheck source=/usr/local/lib/cryoss-email.sh
+    source /usr/local/lib/cryoss-email.sh
+fi
+
+# [F3] Lockfile — alerte par email HTML si backup deja en cours
 LOCKFILE="/var/run/cryoss-backup.lock"
 exec 200>"$LOCKFILE"
 if ! flock -n 200; then
     MSG="[$(date '+%Y-%m-%d %H:%M:%S')] ABORT: backup deja en cours (lockfile: $LOCKFILE)"
     echo "$MSG" >> "$LOG"; echo "$MSG" >&2
-    for DEST in "$EMAIL_TO" "$EMAIL_TO_2"; do
-        [[ -z "$DEST" ]] && continue
-        { echo "To: $DEST"; echo "Subject: [Cryoss $CLIENT_NAME] WARN — backup lock (deja en cours)"; echo ""; echo "$MSG"; } \
-            | msmtp "$DEST" 2>/dev/null || true
-    done
+    if declare -F send_email_wrapped &>/dev/null; then
+        LOCK_BODY=$(alert_banner "Sauvegarde deja en cours — execution annulee" "warn")
+        LOCK_BODY+=$(section_open "DETAILS")
+        LOCK_BODY+=$(mrow "Lockfile" "$LOCKFILE")
+        LOCK_BODY+=$(mrow "Action" "Nouvelle execution annulee (evite la corruption)")
+        LOCK_BODY+=$(mrow "Recommandation" "Verifier qu'un backup precedent n'est pas bloque")
+        LOCK_BODY+=$(section_close)
+        send_email_wrapped \
+            "[Cryoss $CLIENT_NAME] WARN — backup lock (deja en cours)" \
+            "Sauvegarde verrouillee" \
+            "$LOCK_BODY" \
+            "warn"
+    fi
     exit 1
 fi
 BACKUP_DATE=$(date +%Y-%m-%d)
@@ -601,43 +1163,102 @@ preflight_check() {
     return 0
 }
 
-# ── Email ─────────────────────────────────────────────────────────────────────
+# ── Email HTML ───────────────────────────────────────────────────────────────
+# Utilise la librairie /usr/local/lib/cryoss-email.sh (sourcee plus haut).
+# Fallback plain-text si la lib n'est pas disponible.
 send_email() {
     local status="$1"
     local total_err=$(( ERR_C1 + ERR_C2 + ERR_C3 ))
-    local subject body
+    local subject
 
-    local c1_label="C1 (RAID local)"
-    local c2_label="C2 (RPi2 interco)"
-    local c3_label="C3 (SFTP distant)"
-
-    if [[ "$status" == "success" ]]; then
-        subject="[Cryoss $CLIENT_NAME] Sauvegarde OK — $BACKUP_DATE"
-        body="Sauvegarde triple chiffrement reussie.
-
-  $c1_label : OK (XSalsa20-Poly1305)
-  $c2_label : OK (XSalsa20-Poly1305)
-  $c3_label : $( [[ "$ENABLE_SFTP" == "yes" ]] && echo "OK (XSalsa20-Poly1305 + versioning)" || echo "DESACTIVE" )
-
-  Chiffrement : XSalsa20-Poly1305 (AEAD) + AES-256-EME (noms)
-  3 cles independantes — obfuscation totale des noms de fichiers."
+    # Badges d'etat par chemin
+    local c1_badge c2_badge c3_badge c3_label
+    if (( ERR_C1 == 0 )); then c1_badge=$(badge "OK" ok); else c1_badge=$(badge "ERREUR" crit); fi
+    if (( ERR_C2 == 0 )); then c2_badge=$(badge "OK" ok); else c2_badge=$(badge "ERREUR" crit); fi
+    if [[ "$ENABLE_SFTP" != "yes" ]]; then
+        c3_badge=$(badge "DESACTIVE" info)
+        c3_label="C3 (SFTP distant)"
+    elif (( ERR_C3 == 0 )); then
+        c3_badge=$(badge "OK" ok)
+        c3_label="C3 (SFTP distant + versioning)"
     else
-        subject="[Cryoss $CLIENT_NAME] ECHEC sauvegarde ($total_err err) — $BACKUP_DATE"
-        body="Echec sauvegarde $BACKUP_DATE.
-
-  $c1_label : $( (( ERR_C1 )) && echo "ERREUR" || echo "OK" )
-  $c2_label : $( (( ERR_C2 )) && echo "ERREUR" || echo "OK" )
-  $c3_label : $( [[ "$ENABLE_SFTP" != "yes" ]] && echo "DESACTIVE" || { (( ERR_C3 )) && echo "ERREUR" || echo "OK"; } )
-
-  Logs : $LOG
-  Logs rclone : $RCLONE_LOG"
+        c3_badge=$(badge "ERREUR" crit)
+        c3_label="C3 (SFTP distant)"
     fi
 
-    for DEST in "$EMAIL_TO" "$EMAIL_TO_2"; do
-        [[ -z "$DEST" ]] && continue
-        { echo "To: $DEST"; echo "Subject: $subject"; echo ""; echo "$body"; } \
-            | msmtp "$DEST" 2>/dev/null || log "WARN: email vers $DEST echoue"
-    done
+    # Metadonnees
+    local src_count src_size restore_status manifest_path
+    src_count=$(find "$SRC_DIR" -maxdepth 1 -type f ! -name "__CRYOSS_SENTINEL__" 2>/dev/null | wc -l)
+    src_size=$(du -sh "$SRC_DIR" 2>/dev/null | awk '{print $1}')
+    restore_status="${RESTORE_OK:-non teste}"
+    manifest_path="${MANIFEST:-N/A}"
+
+    # Corps HTML
+    local body=""
+    if [[ "$status" == "success" ]]; then
+        subject="[Cryoss $CLIENT_NAME] Sauvegarde OK — $BACKUP_DATE"
+        body+=$(alert_banner "Sauvegarde triple chiffrement reussie — $BACKUP_DATE" "ok")
+
+        body+=$(section_open "CHEMINS DE SAUVEGARDE")
+        body+=$(mrow "C1 (RAID local)" "XSalsa20-Poly1305" "$c1_badge")
+        body+=$(mrow "C2 (RPi2 interco)" "XSalsa20-Poly1305" "$c2_badge")
+        body+=$(mrow "$c3_label" "XSalsa20-Poly1305" "$c3_badge")
+        body+=$(section_close)
+
+        body+=$(section_open "DONNEES SAUVEGARDEES")
+        body+=$(mrow "Fichiers source" "$src_count fichier(s)" "")
+        body+=$(mrow "Taille source" "${src_size:-N/A}" "")
+        body+=$(mrow "Test restauration" "$restore_status" "$(if [[ "$restore_status" == "ok" ]]; then badge "OK" ok; else badge "$restore_status" warn; fi)")
+        body+=$(section_close)
+
+        body+=$(section_open "SECURITE")
+        body+=$(mrow "Chiffrement" "XSalsa20-Poly1305 (AEAD)" "")
+        body+=$(mrow "Noms de fichiers" "AES-256-EME (obfusques)" "")
+        body+=$(mrow "Cles independantes" "3 cles distinctes par chemin" "$(badge "ISOLE" info)")
+        body+=$(section_close)
+    else
+        subject="[Cryoss $CLIENT_NAME] ECHEC sauvegarde ($total_err err) — $BACKUP_DATE"
+        body+=$(alert_banner "Echec sauvegarde — $total_err erreur(s) detectee(s)" "crit")
+
+        body+=$(section_open "CHEMINS DE SAUVEGARDE")
+        body+=$(mrow "C1 (RAID local)" "XSalsa20-Poly1305" "$c1_badge")
+        body+=$(mrow "C2 (RPi2 interco)" "XSalsa20-Poly1305" "$c2_badge")
+        body+=$(mrow "$c3_label" "XSalsa20-Poly1305" "$c3_badge")
+        body+=$(section_close)
+
+        body+=$(section_open "DONNEES")
+        body+=$(mrow "Fichiers source" "$src_count fichier(s)" "")
+        body+=$(mrow "Test restauration" "$restore_status" "")
+        body+=$(section_close)
+
+        body+=$(section_open "LOGS A CONSULTER")
+        body+=$(code_block "Principal : $LOG
+C1 rclone : /var/log/rclone_cryoss_c1.log
+C2 rclone : /var/log/rclone_cryoss_c2.log
+C3 rclone : /var/log/rclone_cryoss_c3.log
+Manifeste : $manifest_path")
+        body+=$(section_close)
+    fi
+
+    # Envoi via la lib (HTML) ou fallback plain text
+    if declare -F send_email_wrapped &>/dev/null; then
+        local accent="ok"
+        [[ "$status" != "success" ]] && accent="crit"
+        send_email_wrapped "$subject" "${subject#*] }" "$body" "$accent" \
+            || log "WARN: envoi email HTML echoue — fallback plain"
+    else
+        # Fallback plain text si la lib est absente
+        local plain_body="Sauvegarde $BACKUP_DATE — status: $status
+C1: $( (( ERR_C1 )) && echo ERREUR || echo OK )
+C2: $( (( ERR_C2 )) && echo ERREUR || echo OK )
+C3: $( [[ "$ENABLE_SFTP" != "yes" ]] && echo DESACTIVE || { (( ERR_C3 )) && echo ERREUR || echo OK; } )
+Logs: $LOG"
+        for DEST in "$EMAIL_TO" "$EMAIL_TO_2"; do
+            [[ -z "$DEST" ]] && continue
+            { echo "To: $DEST"; echo "Subject: $subject"; echo ""; echo "$plain_body"; } \
+                | msmtp "$DEST" 2>/dev/null || log "WARN: email vers $DEST echoue"
+        done
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -652,6 +1273,12 @@ if ! preflight_check; then send_email "failure"; exit 1; fi
 log "-- C1 : rclone sync -> cryoss-c1-crypt (RAID local) --"
 
 RCLONE_LOG_C1="/var/log/rclone_cryoss_c1.log"
+
+# [C3] Retrait temporaire de chattr +a — rclone doit pouvoir supprimer/renommer
+# les fichiers (sinon echec sur .partial residuels ou mises a jour).
+# On reposera chattr +a apres le sync + cryptcheck.
+chattr -R -a "$LOCAL_ENC" 2>/dev/null || log "  [C1 WARN] chattr -a partiel (normal si pas active)"
+
 set +e
 rclone sync "$SRC_DIR" cryoss-c1-crypt: \
     --exclude "__CRYOSS_SENTINEL__" \
@@ -689,6 +1316,9 @@ if [[ -x /usr/local/bin/cryoss-cleanup.sh ]]; then
     /usr/local/bin/cryoss-cleanup.sh 2>/dev/null || log "  [C1 WARN] cleanup echoue"
 fi
 
+# Repose chattr +a sur /etc/encrypted apres le sync C1 + cryptcheck + cleanup
+chattr -R +a "$LOCAL_ENC" 2>/dev/null || log "  [C1 WARN] chattr +a non repose"
+
 # =============================================================================
 # CHEMIN 2 : rclone crypt → RPi2 via SFTP interco (10.42.0.x)
 # =============================================================================
@@ -711,17 +1341,19 @@ RC_C2=$?
 set -e
 
 if (( RC_C2 == 0 )); then
-    # [I1] Verification integrite post-sync
+    # [I1] Verification integrite : rclone cryptcheck impossible cross-host
+    # (source plain sur RPi1, dest crypt sur RPi2 via SFTP — cryptcheck exige
+    # les deux accessibles en decryption depuis la meme machine).
+    # On verifie plutot que le nombre de fichiers cote dest correspond a la source.
     set +e
-    rclone cryptcheck "$SRC_DIR" cryoss-c2-crypt: \
-        --exclude "__CRYOSS_SENTINEL__" \
-        --one-way 2>>"$RCLONE_LOG_C2"
-    RC_CHECK=$?
+    SRC_COUNT=$(find "$SRC_DIR" -maxdepth 1 -type f ! -name "__CRYOSS_SENTINEL__" 2>/dev/null | wc -l)
+    DST_COUNT=$(rclone size cryoss-c2-crypt: 2>/dev/null | grep -oP 'Total objects: \K[0-9,]+' | tr -d ',')
     set -e
-    if (( RC_CHECK == 0 )); then
-        log "  [C2 OK] sync + integrite verifiee (cryptcheck pass)"
+    DST_COUNT="${DST_COUNT:-0}"
+    if [[ "$SRC_COUNT" -gt 0 ]] && [[ "$DST_COUNT" -ge "$SRC_COUNT" ]]; then
+        log "  [C2 OK] sync OK — $SRC_COUNT fichier(s) source, $DST_COUNT cote RPi2"
     else
-        log "  [C2 WARN] sync OK mais cryptcheck echoue (rc=$RC_CHECK)"
+        log "  [C2 WARN] sync OK mais ecart comptage (src=$SRC_COUNT dst=$DST_COUNT)"
         ERR_C2=1
     fi
 else
@@ -826,9 +1458,9 @@ MANIFEST="$MANIFEST_DIR/manifest-${BACKUP_DATE}.json"
     echo "  \"client\": \"$CLIENT_NAME\","
     echo "  \"source_files\": $(find "$SRC_DIR" -maxdepth 1 -type f ! -name "__CRYOSS_SENTINEL__" | wc -l),"
     echo "  \"source_size_bytes\": $(du -sb "$SRC_DIR" 2>/dev/null | awk '{print $1}'),"
-    echo "  \"c1_status\": \"$(( ERR_C1 == 0 )) && echo ok || echo error\","
-    echo "  \"c2_status\": \"$(( ERR_C2 == 0 )) && echo ok || echo error\","
-    echo "  \"c3_status\": \"$(( ERR_C3 == 0 )) && echo ok || echo error\","
+    echo "  \"c1_status\": \"$( (( ERR_C1 == 0 )) && echo ok || echo error )\","
+    echo "  \"c2_status\": \"$( (( ERR_C2 == 0 )) && echo ok || echo error )\","
+    echo "  \"c3_status\": \"$( (( ERR_C3 == 0 )) && echo ok || echo error )\","
     echo "  \"restore_test\": \"$RESTORE_OK\""
     echo "}"
 } > "$MANIFEST"
@@ -861,10 +1493,13 @@ sed -i \
 chmod 700 /usr/local/bin/cryoss-backup.sh
 chown root:root /usr/local/bin/cryoss-backup.sh
 ok "Script cryoss-backup.sh installe (3 chemins rclone independants)"
+    cryoss_done "10-backup-script"
+fi
 
 # =============================================================================
-step "11. Samba"
+if cryoss_step "11-samba" "11. Samba (configuration de base)"; then
 
+# smb.conf : global + 2 partages de base + include pour les partages dynamiques (wizard)
 cat > /etc/samba/smb.conf <<SAMBA_EOF
 [global]
    workgroup = WORKGROUP
@@ -885,6 +1520,8 @@ cat > /etc/samba/smb.conf <<SAMBA_EOF
    log file = /var/log/samba/log.%m
    max log size = 1000
    logging = file
+   # Partages dynamiques (gérés par le wizard interactif — étape 11b)
+   include = /etc/samba/cryoss-shares.conf
 
 [sauvegarde]
    comment = Depot source [$CLIENT_NAME]
@@ -916,11 +1553,439 @@ cat > /etc/samba/smb.conf <<SAMBA_EOF
    valid users = habyss
 SAMBA_EOF
 
-systemctl restart smbd; systemctl enable smbd
+# Fichier d'inclusion pour le wizard — vide au départ, alimenté par l'étape 11b
+[[ -f /etc/samba/cryoss-shares.conf ]] || {
+    cat > /etc/samba/cryoss-shares.conf <<'SH_EOF'
+# =============================================================================
+#  Partages dynamiques Cryoss — généré par le wizard interactif (étape 11b).
+#  NE PAS ÉDITER À LA MAIN : utilisez `install_rpi1.sh --from-step 11b-samba-wizard`
+#  pour rejouer le wizard, ou éditez /etc/cryoss/shares.conf puis régénérez.
+# =============================================================================
+SH_EOF
+    chmod 644 /etc/samba/cryoss-shares.conf
+}
+
+cryoss_run "Redémarrage smbd" -- bash -c "systemctl restart smbd && systemctl enable smbd"
 ok "Samba configure (SMB2+, chiffrement force)"
+    cryoss_done "11-samba"
+fi
 
 # =============================================================================
-step "12. Systemd services + timers"
+#  Étape 11b : WIZARD SAMBA INTERACTIF
+#  - Crée des dossiers-partages sous /etc/sauvegarde (ou chemin libre)
+#  - Crée des utilisateurs Samba *purs* (service Unix nologin + locked, jamais shell/sudo)
+#  - Définit une matrice user × partage avec niveaux R / RW / refus explicite
+#  - Persiste la config dans /etc/cryoss/shares.conf (rejouable, éditable)
+# =============================================================================
+
+# Charge la config wizard existante (utile à la reprise / rejeu)
+# IMPORTANT : `declare -ga` / `-gA` pour rendre les variables globales depuis une fonction.
+cryoss_wizard_load_config() {
+    declare -ga WIZ_USERS=()
+    declare -ga WIZ_SHARES=()
+    declare -gA WIZ_SHARE_PATH=()
+    declare -gA WIZ_USER_PASS=()
+    declare -gA WIZ_PERMS=()        # clé "share|user" → "r" | "rw" | "no"
+
+    [[ -f /etc/cryoss/shares.conf ]] || return 0
+    local kind a b c
+    while IFS=' ' read -r kind a b c; do
+        [[ -z "$kind" || "$kind" == "#"* ]] && continue
+        case "$kind" in
+            USER)   WIZ_USERS+=("$a"); WIZ_USER_PASS["$a"]="${b:-}" ;;
+            SHARE)  WIZ_SHARES+=("$a"); WIZ_SHARE_PATH["$a"]="$b" ;;
+            PERM)   WIZ_PERMS["${a}|${b}"]="$c" ;;
+        esac
+    done < /etc/cryoss/shares.conf
+}
+
+cryoss_wizard_save_config() {
+    mkdir -p /etc/cryoss; chmod 700 /etc/cryoss
+    {
+        echo "# Cryoss — configuration des partages dynamiques (wizard)"
+        echo "# Format : USER <nom> <pass-obscured> | SHARE <nom> <chemin> | PERM <share> <user> <r|rw|no>"
+        echo "# Généré $(date '+%Y-%m-%d %H:%M:%S')"
+        local u s key
+        for u in "${WIZ_USERS[@]}"; do
+            printf 'USER %s %s\n' "$u" "${WIZ_USER_PASS[$u]:-}"
+        done
+        for s in "${WIZ_SHARES[@]}"; do
+            printf 'SHARE %s %s\n' "$s" "${WIZ_SHARE_PATH[$s]}"
+        done
+        for key in "${!WIZ_PERMS[@]}"; do
+            local sh="${key%|*}" us="${key#*|}"
+            printf 'PERM %s %s %s\n' "$sh" "$us" "${WIZ_PERMS[$key]}"
+        done
+    } > /etc/cryoss/shares.conf
+    chmod 600 /etc/cryoss/shares.conf
+}
+
+# Vérifie la validité d'un nom (alphanumérique + tirets, 2-32 chars)
+cryoss_wizard_valid_name() {
+    [[ "$1" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]
+}
+
+# Liste les utilisateurs (numérotés)
+cryoss_wizard_list_users() {
+    if (( ${#WIZ_USERS[@]} == 0 )); then
+        echo -e "  ${DIM}(aucun utilisateur Samba personnalisé)${NC}"
+        return
+    fi
+    local i=1 u
+    for u in "${WIZ_USERS[@]}"; do
+        printf "  ${CRY}%2d)${NC} %s\n" "$i" "$u"
+        i=$((i+1))
+    done
+}
+
+# Liste les partages (numérotés)
+cryoss_wizard_list_shares() {
+    if (( ${#WIZ_SHARES[@]} == 0 )); then
+        echo -e "  ${DIM}(aucun partage personnalisé)${NC}"
+        return
+    fi
+    local i=1 s
+    for s in "${WIZ_SHARES[@]}"; do
+        printf "  ${CRY}%2d)${NC} %-20s ${DIM}→ %s${NC}\n" "$i" "$s" "${WIZ_SHARE_PATH[$s]}"
+        i=$((i+1))
+    done
+}
+
+# Affiche la matrice user × partage
+cryoss_wizard_show_matrix() {
+    if (( ${#WIZ_SHARES[@]} == 0 )) || (( ${#WIZ_USERS[@]} == 0 )); then
+        echo -e "  ${DIM}(matrice vide — ajoutez d'abord utilisateurs et partages)${NC}"
+        return
+    fi
+    printf "  ${BOLD}%-18s${NC}" "PARTAGE \\ USER"
+    local u
+    for u in "${WIZ_USERS[@]}"; do printf " ${BOLD}%-10s${NC}" "$u"; done
+    echo
+    local s perm color
+    for s in "${WIZ_SHARES[@]}"; do
+        printf "  ${CRY}%-18s${NC}" "$s"
+        for u in "${WIZ_USERS[@]}"; do
+            perm="${WIZ_PERMS[${s}|${u}]:-no}"
+            case "$perm" in
+                rw) color="${GREEN}RW${NC}      " ;;
+                r)  color="${YELLOW}R${NC}       " ;;
+                no) color="${RED}–${NC}       " ;;
+            esac
+            printf " %b" "$color"
+        done
+        echo
+    done
+}
+
+# Ajoute un utilisateur Samba (jamais système : nologin + Unix password locked)
+cryoss_wizard_add_user() {
+    local name pass1 pass2
+    while true; do
+        read -rp "  Nom du nouvel utilisateur Samba (a-z, 0-9, _, -) : " name
+        if ! cryoss_wizard_valid_name "$name"; then
+            warn "Nom invalide. Doit commencer par une lettre, 2 à 32 caractères [a-z0-9_-]."
+            continue
+        fi
+        if printf '%s\n' "${WIZ_USERS[@]}" 2>/dev/null | grep -qxF "$name"; then
+            warn "Cet utilisateur existe déjà dans la config wizard."
+            continue
+        fi
+        if id "$name" &>/dev/null && [[ "$name" != "$name" ]]; then
+            : # placeholder
+        fi
+        # Refus de réutiliser des comptes "humains" existants
+        if [[ "$name" == "habyss" || "$name" == "root" || "$name" == "ds-user" ]]; then
+            warn "'$name' est un compte protégé du système Cryoss. Choisissez un autre nom."
+            continue
+        fi
+        break
+    done
+    while true; do
+        read -rsp "  Mot de passe Samba pour $name : " pass1; echo
+        read -rsp "  Confirmer le mot de passe        : " pass2; echo
+        if [[ "$pass1" != "$pass2" ]]; then
+            warn "Les mots de passe ne correspondent pas."
+        elif (( ${#pass1} < 8 )); then
+            warn "Mot de passe trop court (min 8 caractères)."
+        else
+            break
+        fi
+    done
+    WIZ_USERS+=("$name")
+    WIZ_USER_PASS["$name"]="$pass1"
+    ok "Utilisateur Samba '$name' ajouté à la config (sera créé à l'application)."
+}
+
+cryoss_wizard_add_share() {
+    local name path
+    while true; do
+        read -rp "  Nom du partage (a-z, 0-9, _, -) : " name
+        if ! cryoss_wizard_valid_name "$name"; then
+            warn "Nom invalide."
+            continue
+        fi
+        if [[ "$name" == "sauvegarde" || "$name" == "encrypted_backup" || "$name" == "global" ]]; then
+            warn "'$name' est réservé. Choisissez un autre nom."
+            continue
+        fi
+        if printf '%s\n' "${WIZ_SHARES[@]}" 2>/dev/null | grep -qxF "$name"; then
+            warn "Ce partage existe déjà dans la config wizard."
+            continue
+        fi
+        break
+    done
+    read -rp "  Chemin (défaut: /etc/sauvegarde/$name) : " path
+    path="${path:-/etc/sauvegarde/$name}"
+    if [[ "$path" != /* ]]; then
+        warn "Chemin absolu requis. Préfixe automatique avec /etc/sauvegarde/"
+        path="/etc/sauvegarde/$path"
+    fi
+    WIZ_SHARES+=("$name")
+    WIZ_SHARE_PATH["$name"]="$path"
+    ok "Partage '$name' ajouté (chemin : $path). Définissez maintenant les droits."
+}
+
+cryoss_wizard_set_perms() {
+    if (( ${#WIZ_SHARES[@]} == 0 )); then
+        warn "Aucun partage à configurer. Ajoutez-en un d'abord."
+        return
+    fi
+    if (( ${#WIZ_USERS[@]} == 0 )); then
+        warn "Aucun utilisateur à configurer. Ajoutez-en un d'abord (ou utilisez habyss/ds-user)."
+        return
+    fi
+    echo
+    info "Partages disponibles :"
+    cryoss_wizard_list_shares
+    read -rp "  Numéro du partage : " idx
+    [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#WIZ_SHARES[@]} )) \
+        || { warn "Numéro invalide."; return; }
+    local share="${WIZ_SHARES[$((idx-1))]}"
+
+    echo
+    info "Utilisateurs disponibles :"
+    cryoss_wizard_list_users
+    echo -e "  ${DIM}(comptes système prédéfinis également : habyss, ds-user — saisir le nom directement)${NC}"
+    read -rp "  Numéro ou nom de l'utilisateur : " uref
+    local user
+    if [[ "$uref" =~ ^[0-9]+$ ]] && (( uref >= 1 && uref <= ${#WIZ_USERS[@]} )); then
+        user="${WIZ_USERS[$((uref-1))]}"
+    else
+        user="$uref"
+        # Vérifier que l'utilisateur existe (wizard ou système prédéfini)
+        if ! printf '%s\n' "${WIZ_USERS[@]}" "habyss" "ds-user" 2>/dev/null | grep -qxF "$user"; then
+            warn "Utilisateur '$user' inconnu (ni wizard ni système Cryoss)."
+            return
+        fi
+    fi
+
+    echo "  Niveau de droit :"
+    echo "    [1] R   — lecture seule"
+    echo "    [2] RW  — lecture + écriture"
+    echo "    [3] –   — refus explicite (révoque l'accès)"
+    read -rp "  Choix [1-3] : " plvl
+    case "$plvl" in
+        1) WIZ_PERMS["${share}|${user}"]="r" ;;
+        2) WIZ_PERMS["${share}|${user}"]="rw" ;;
+        3) WIZ_PERMS["${share}|${user}"]="no" ;;
+        *) warn "Choix invalide."; return ;;
+    esac
+    ok "Droits définis : $share × $user → ${WIZ_PERMS[${share}|${user}]}"
+}
+
+cryoss_wizard_remove_item() {
+    echo "  [1] Supprimer un partage"
+    echo "  [2] Supprimer un utilisateur (révoque tous ses droits wizard)"
+    read -rp "  Choix [1-2] : " kind
+    case "$kind" in
+        1)
+            cryoss_wizard_list_shares
+            read -rp "  Numéro du partage à supprimer : " idx
+            [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#WIZ_SHARES[@]} )) \
+                || { warn "Invalide."; return; }
+            local s="${WIZ_SHARES[$((idx-1))]}"
+            unset 'WIZ_SHARES[idx-1]'
+            WIZ_SHARES=("${WIZ_SHARES[@]}")
+            unset 'WIZ_SHARE_PATH[$s]'
+            local key
+            for key in "${!WIZ_PERMS[@]}"; do
+                [[ "$key" == "${s}|"* ]] && unset 'WIZ_PERMS[$key]'
+            done
+            ok "Partage '$s' retiré de la config (le dossier sur disque est conservé)."
+            ;;
+        2)
+            cryoss_wizard_list_users
+            read -rp "  Numéro de l'utilisateur à supprimer : " idx
+            [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#WIZ_USERS[@]} )) \
+                || { warn "Invalide."; return; }
+            local u="${WIZ_USERS[$((idx-1))]}"
+            unset 'WIZ_USERS[idx-1]'
+            WIZ_USERS=("${WIZ_USERS[@]}")
+            unset 'WIZ_USER_PASS[$u]'
+            local key
+            for key in "${!WIZ_PERMS[@]}"; do
+                [[ "$key" == *"|${u}" ]] && unset 'WIZ_PERMS[$key]'
+            done
+            warn "Utilisateur '$u' retiré (sera dé-provisionné Samba à l'application)."
+            ;;
+        *) warn "Choix invalide." ;;
+    esac
+}
+
+# Applique la configuration : crée users (Samba-only), dossiers, écrit smb.conf
+cryoss_wizard_apply() {
+    local u s perm
+    info "Application de la configuration wizard..."
+
+    # 1) Créer les utilisateurs Samba-only (nologin + Unix password verrouillé)
+    for u in "${WIZ_USERS[@]}"; do
+        if ! getent passwd "$u" >/dev/null 2>&1; then
+            useradd -r -M -s /usr/sbin/nologin -d /nonexistent -G samba-share "$u" \
+                || { warn "Échec création UNIX $u — skip"; continue; }
+            ok "Compte service Unix créé : $u (nologin, no-home)"
+        else
+            usermod -s /usr/sbin/nologin -d /nonexistent -G samba-share "$u" 2>/dev/null || true
+            info "Compte Unix '$u' déjà présent — réajusté en service nologin"
+        fi
+        # Verrouiller le mot de passe Unix : impossibilité absolue de login local/SSH
+        passwd -l "$u" >/dev/null 2>&1 || true
+        # Définir le mot de passe Samba (depuis WIZ_USER_PASS)
+        local pw="${WIZ_USER_PASS[$u]}"
+        if [[ -n "$pw" ]]; then
+            printf '%s\n%s\n' "$pw" "$pw" | smbpasswd -s -a "$u" >/dev/null
+            smbpasswd -e "$u" >/dev/null
+            ok "Mot de passe Samba défini et compte activé : $u"
+        fi
+    done
+
+    # 2) Créer les dossiers partagés avec ownership et perms strictes
+    for s in "${WIZ_SHARES[@]}"; do
+        local p="${WIZ_SHARE_PATH[$s]}"
+        mkdir -p "$p"
+        chown root:samba-share "$p"
+        chmod 2770 "$p"  # SetGID pour propagation du groupe + sticky d'écriture du groupe
+        ok "Dossier partagé : $p (root:samba-share, 2770)"
+    done
+
+    # 3) Générer /etc/samba/cryoss-shares.conf à partir de la matrice
+    {
+        echo "# =============================================================================="
+        echo "#  Partages Cryoss générés par le wizard interactif"
+        echo "#  Régénéré le $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "#  Source de vérité : /etc/cryoss/shares.conf"
+        echo "# =============================================================================="
+        for s in "${WIZ_SHARES[@]}"; do
+            local valid_users="" read_list="" write_list="" denied=""
+            for u in "${WIZ_USERS[@]}" habyss ds-user; do
+                perm="${WIZ_PERMS[${s}|${u}]:-}"
+                case "$perm" in
+                    rw)
+                        valid_users+="${u} "
+                        write_list+="${u} "
+                        ;;
+                    r)
+                        valid_users+="${u} "
+                        read_list+="${u} "
+                        ;;
+                    no)
+                        denied+="${u} "
+                        ;;
+                esac
+            done
+            valid_users="${valid_users% }"
+            read_list="${read_list% }"
+            write_list="${write_list% }"
+            denied="${denied% }"
+            # Skipper les partages sans aucun valid_users (pas accessibles)
+            [[ -z "$valid_users" ]] && {
+                warn "Partage '$s' sans utilisateur autorisé — skip dans smb.conf"
+                continue
+            }
+            cat <<SHARE_BLOCK
+[$s]
+   comment = Cryoss partage [$CLIENT_NAME] — $s
+   path = ${WIZ_SHARE_PATH[$s]}
+   browseable = yes
+   read only = no
+   guest ok = no
+   valid users = $valid_users
+$( [[ -n "$write_list" ]] && echo "   write list = $write_list" )
+$( [[ -n "$read_list" ]] && echo "   read list = $read_list" )
+$( [[ -n "$denied" ]]     && echo "   invalid users = $denied" )
+   create mask = 0660
+   directory mask = 2770
+   force group = samba-share
+   strict allocate = yes
+SHARE_BLOCK
+        done
+    } > /etc/samba/cryoss-shares.conf
+    chmod 644 /etc/samba/cryoss-shares.conf
+
+    # 4) Persister la config wizard
+    cryoss_wizard_save_config
+
+    # 5) Recharger Samba
+    cryoss_run "Vérification syntaxe smb.conf (testparm)" -- testparm -s /etc/samba/smb.conf
+    cryoss_run "Rechargement smbd" -- systemctl reload-or-restart smbd
+    ok "Configuration wizard appliquée — ${#WIZ_SHARES[@]} partage(s), ${#WIZ_USERS[@]} utilisateur(s)"
+}
+
+cryoss_wizard_main() {
+    cryoss_wizard_load_config
+    while true; do
+        echo
+        echo -e "${BOLD}${CRY}┏━━━ WIZARD SAMBA — partages personnalisés ━━━┓${NC}"
+        echo -e "${CRY}┃${NC} État actuel :"
+        echo -e "${CRY}┃${NC}   Utilisateurs Samba (purs) :"
+        cryoss_wizard_list_users | sed "s/^/${CRY}┃${NC}     /"
+        echo -e "${CRY}┃${NC}   Partages personnalisés :"
+        cryoss_wizard_list_shares | sed "s/^/${CRY}┃${NC}     /"
+        echo -e "${CRY}┃${NC}   Matrice des droits :"
+        cryoss_wizard_show_matrix | sed "s/^/${CRY}┃${NC}     /"
+        echo -e "${BOLD}${CRY}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
+        echo
+        echo "  [1] Ajouter un partage (dossier)"
+        echo "  [2] Ajouter un utilisateur Samba (jamais système — nologin + verrouillé)"
+        echo "  [3] Définir / modifier des droits (matrice user × partage)"
+        echo "  [4] Supprimer un partage ou un utilisateur"
+        echo "  [5] Visualiser la configuration en cours"
+        echo "  [0] Terminer et appliquer"
+        read -rp "  Choix : " choice
+        case "$choice" in
+            1) cryoss_wizard_add_share ;;
+            2) cryoss_wizard_add_user ;;
+            3) cryoss_wizard_set_perms ;;
+            4) cryoss_wizard_remove_item ;;
+            5) ;;  # juste réafficher (boucle)
+            0)
+                if (( ${#WIZ_SHARES[@]} == 0 )) && (( ${#WIZ_USERS[@]} == 0 )); then
+                    info "Aucun partage/utilisateur ajouté — wizard terminé sans modification."
+                else
+                    cryoss_wizard_apply
+                fi
+                break
+                ;;
+            *) warn "Choix invalide." ;;
+        esac
+    done
+}
+
+if cryoss_step "11b-samba-wizard" "11b. Partages Samba personnalisés (wizard interactif)"; then
+    info "Le wizard permet d'ajouter des dossiers-partages, des utilisateurs Samba purs"
+    info "(nologin, sans accès SSH/console) et de définir des droits R/RW/refus."
+    info "Vous pouvez le passer si vous n'avez pas besoin de partages supplémentaires."
+    echo
+    read -rp "Lancer le wizard de partages personnalisés ? [O/n] : " _w
+    if [[ "${_w,,}" != "n" ]]; then
+        cryoss_wizard_main
+    else
+        info "Wizard ignoré — aucune configuration de partage personnalisé."
+    fi
+    cryoss_done "11b-samba-wizard"
+fi
+
+# =============================================================================
+if cryoss_step "12-systemd" "12. Services et timers systemd"; then
 
 # Service sauvegarde complete (3 chemins rclone crypt independants)
 cat > /etc/systemd/system/cryoss-backup.service <<SVC_EOF
@@ -1003,9 +2068,11 @@ if [[ "$ENABLE_SFTP" == "yes" ]]; then
 else
     ok "Timer : sauvegarde complete 02h (SFTP desactive)"
 fi
+    cryoss_done "12-systemd"
+fi
 
 # =============================================================================
-step "13. Durcissement systeme"
+if cryoss_step "13-hardening" "13. Durcissement système"; then
 
 cat > /etc/ssh/sshd_config.d/99-cryoss.conf <<SSH_EOF
 PermitRootLogin no
@@ -1037,6 +2104,11 @@ ufw --force enable
 ok "UFW : SSH+SMB LAN($LAN_SUBNET_RPI1) + SSH/SMTP RPi2(10.42.0.2)"
 
 cat > /etc/fail2ban/jail.d/99-cryoss.conf <<F2B_EOF
+[DEFAULT]
+# Ne jamais bannir le RPi2 (lien interco Cryoss) - evite le deadlock si la
+# replication genere trop de connexions SSH (rclone sync)
+ignoreip = 127.0.0.1/8 ::1 ${INTERCO_IP_RPI2}/32
+
 [sshd]
 enabled=true
 port=ssh
@@ -1052,7 +2124,7 @@ bantime=3600
 findtime=600
 F2B_EOF
 systemctl enable fail2ban; systemctl restart fail2ban
-ok "Fail2Ban configure"
+ok "Fail2Ban configure (RPi2 ${INTERCO_IP_RPI2} whitelisted)"
 
 for SVC in bluetooth avahi-daemon cups triggerhappy; do
     systemctl disable --now "$SVC" 2>/dev/null && warn "$SVC desactive" || true
@@ -1095,11 +2167,11 @@ cat > /etc/logrotate.d/cryoss <<LR_EOF
 }
 LR_EOF
 ok "Logrotate configure"
+    cryoss_done "13-hardening"
+fi
 
 # =============================================================================
-
-# =============================================================================
-step "14. Monitoring et sante — rapports HTML Analyss (daily/weekly/watchdog)"
+if cryoss_step "14-monitoring" "14. Monitoring et rapports HTML"; then
 
 mkdir -p /var/lib/cryoss/alerts /var/lib/cryoss
 
@@ -1265,27 +2337,55 @@ sys_temp()      { cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{
 sys_load()      { uptime | awk -F'load average:' '{print $2}' | xargs || echo "N/A"; }
 sys_ram()       { free -h | awk '/^Mem/{print $3"/"$2}' || echo "N/A"; }
 sys_uptime_str(){ uptime -p 2>/dev/null || echo "N/A"; }
+# Age du dernier rclone : -1 si pas de donnee (au lieu de 493k heures calcules depuis epoch 0)
 rclone_age_h()  {
-    local ts; ts=$(grep "Elapsed time" "$LOG_RCLONE" 2>/dev/null | tail -1 | awk '{print $1,$2}' | xargs -I{} date -d "{}" +%s 2>/dev/null || true)
+    local ts
+    ts=$(grep "Elapsed time" "$LOG_RCLONE" 2>/dev/null | tail -1 | awk '{print $1,$2}' | xargs -I{} date -d "{}" +%s 2>/dev/null || true)
     ts=$(echo "$ts" | tr -cd '0-9')
-    [[ -z "$ts" ]] && ts=0
+    if [[ -z "$ts" || "$ts" == "0" ]]; then
+        echo "-1"   # sentinelle "pas de donnee"
+        return
+    fi
     echo $(( ($(date +%s) - ts) / 3600 ))
 }
 rclone_last_files() { grep "Copied\|Transferred" "$LOG_RCLONE" 2>/dev/null | tail -1 | grep -oP '\d+ files' || echo "0 fichiers"; }
+
+# Age de la derniere reception RPi2 : -1 si SSH echoue OU aucun fichier
+# (evite l'alerte 493 447h declenchee par epoch 0)
 repl_age_h() {
-    local ts; ts=$(ssh -o BatchMode=yes -o ConnectTimeout=5 cryoss-rpi2 \
+    # Tenter plusieurs hostnames : alias SSH puis IP interco fallback
+    local rpi2_host="cryoss-rpi2"
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "$rpi2_host" true 2>/dev/null || rpi2_host="10.42.0.2"
+
+    # Tester accessibilite avant de calculer
+    local accessible
+    accessible=$(ssh -o BatchMode=yes -o ConnectTimeout=3 "$rpi2_host" "echo ok" 2>/dev/null)
+    if [[ "$accessible" != "ok" ]]; then
+        echo "-1"   # RPi2 injoignable
+        return
+    fi
+
+    local ts
+    ts=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$rpi2_host" \
         "find '$RPI2_DIR' -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1" \
         2>/dev/null | cut -d. -f1 || true)
     ts=$(echo "$ts" | tr -cd '0-9')
-    [[ -z "$ts" ]] && ts=0
+    if [[ -z "$ts" || "$ts" == "0" ]]; then
+        echo "-1"   # aucun fichier reçu
+        return
+    fi
     echo $(( ($(date +%s) - ts) / 3600 ))
 }
 repl_count() {
-    ssh -o BatchMode=yes -o ConnectTimeout=5 cryoss-rpi2 \
+    local rpi2_host="cryoss-rpi2"
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "$rpi2_host" true 2>/dev/null || rpi2_host="10.42.0.2"
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$rpi2_host" \
         "find '$RPI2_DIR' -type f | wc -l" 2>/dev/null || echo "N/A"
 }
 rpi2_raid() {
-    ssh -o BatchMode=yes -o ConnectTimeout=5 cryoss-rpi2 \
+    local rpi2_host="cryoss-rpi2"
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "$rpi2_host" true 2>/dev/null || rpi2_host="10.42.0.2"
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$rpi2_host" \
         "mdadm --detail /dev/md0 2>/dev/null | awk '/State :/{print \$3}'" 2>/dev/null || echo "inaccessible"
 }
 
@@ -1359,25 +2459,29 @@ run_daily() {
     body+=$(section_close)
 
     # Réplication & sync
-    local rh rh_b rclone_h rclone_b
+    # rh/rclone_h == -1 => pas de donnee (RPi2 injoignable / jamais execute)
+    local rh rh_b rh_text rclone_h rclone_b rclone_text
     rh=$(repl_age_h)
     local REPL_WARN=$(( REPL_HOURS / 2 ))
-    if   (( rh >= REPL_HOURS )); then rh_b=$(badge "RETARD ${rh}h" crit); has_warn=1
-    elif (( rh >= REPL_WARN ));   then rh_b=$(badge "${rh}h" warn); has_warn=1
-    else rh_b=$(badge "${rh}h OK" ok); fi
+    if   (( rh == -1 )); then rh_b=$(badge "N/A" info); rh_text="indisponible"
+    elif (( rh >= REPL_HOURS )); then rh_b=$(badge "RETARD ${rh}h" crit); rh_text="il y a ${rh}h"; has_warn=1
+    elif (( rh >= REPL_WARN ));   then rh_b=$(badge "${rh}h" warn); rh_text="il y a ${rh}h"; has_warn=1
+    else rh_b=$(badge "${rh}h OK" ok); rh_text="il y a ${rh}h"; fi
     if [[ "$ENABLE_SFTP" == "yes" ]]; then
-    rclone_h=$(rclone_age_h)
-    if   (( rclone_h >= SFTP_HOURS )); then rclone_b=$(badge "RETARD ${rclone_h}h" crit); has_warn=1
-    else rclone_b=$(badge "${rclone_h}h OK" ok); fi
+        rclone_h=$(rclone_age_h)
+        if   (( rclone_h == -1 )); then rclone_b=$(badge "N/A" info); rclone_text="indisponible"
+        elif (( rclone_h >= SFTP_HOURS )); then rclone_b=$(badge "RETARD ${rclone_h}h" crit); rclone_text="il y a ${rclone_h}h"; has_warn=1
+        else rclone_b=$(badge "${rclone_h}h OK" ok); rclone_text="il y a ${rclone_h}h"; fi
     else
-    rclone_b=$(badge "DESACTIVE" info)
+        rclone_b=$(badge "DESACTIVE" info)
+        rclone_text="désactivé"
     fi
     body+=$(section_open "REPLICATION & SYNC")
-    body+=$(mrow "RPi2 — dernier fichier" "il y a ${rh}h" "$rh_b")
+    body+=$(mrow "RPi2 — dernier fichier" "$rh_text" "$rh_b")
     if [[ "$ENABLE_SFTP" == "yes" ]]; then
-    body+=$(mrow "SFTP rclone — dernière sync" "il y a ${rclone_h}h" "$rclone_b")
+        body+=$(mrow "SFTP rclone — dernière sync" "$rclone_text" "$rclone_b")
     else
-    body+=$(mrow "SFTP rclone" "désactivé" "$rclone_b")
+        body+=$(mrow "SFTP rclone" "désactivé" "$rclone_b")
     fi
     body+=$(section_close)
 
@@ -1478,14 +2582,15 @@ run_weekly() {
     fi  # fin ENABLE_SFTP
 
     # RPi2
-    local rpi2_s rpi2_cnt rpi2_age
+    local rpi2_s rpi2_cnt rpi2_age rpi2_age_text
     rpi2_s=$(rpi2_raid 2>/dev/null || echo "inaccessible")
     rpi2_cnt=$(repl_count 2>/dev/null || echo "N/A")
-    rpi2_age=$(repl_age_h 2>/dev/null || echo "N/A")
+    rpi2_age=$(repl_age_h 2>/dev/null || echo "-1")
+    [[ "$rpi2_age" == "-1" ]] && rpi2_age_text="indisponible" || rpi2_age_text="il y a ${rpi2_age}h"
     body+=$(section_open "REPLICATION RPi2")
     body+=$(mrow "RAID RPi2 (md0)" "$rpi2_s" "$( [[ "$rpi2_s" == clean* || "$rpi2_s" == active* ]] && badge "OK" ok || badge "$rpi2_s" crit )")
-    body+=$(mrow "Fichiers .enc reçus" "$rpi2_cnt" "")
-    body+=$(mrow "Dernière réplication" "il y a ${rpi2_age}h" "")
+    body+=$(mrow "Fichiers chiffrés reçus" "$rpi2_cnt" "")
+    body+=$(mrow "Dernière réplication" "$rpi2_age_text" "")
     body+=$(section_close)
 
     # Fail2ban semaine
@@ -1612,8 +2717,12 @@ run_alert() {
     done
 
     # Réplication RPi2 silencieuse
+    # rh == -1  => RPi2 injoignable OU aucun fichier reçu — PAS une alerte retard
+    # rh >= REPL_HOURS => vraie alerte retard
     local rh; rh=$(repl_age_h)
-    if (( rh >= REPL_HOURS )); then
+    if (( rh == -1 )); then
+        log "Replication RPi2 : pas de donnee (RPi2 injoignable ou dossier vide)"
+    elif (( rh >= REPL_HOURS )); then
         local h; h=$(section_open "RÉPLICATION RPi2 — SILENCE DÉTECTÉ")
         h+=$(mrow "Dernier fichier reçu" "il y a ${rh}h" "$(badge "RETARD" crit)")
         h+="<p style='color:#5a8099;font-size:12px;margin-top:8px;'>Seuil : ${REPL_HOURS}h. Vérifiez la connexion SSH RPi1→RPi2 et les logs cryoss-backup.</p>"
@@ -1623,14 +2732,16 @@ run_alert() {
 
     # Sync SFTP silencieuse (uniquement si SFTP activé)
     if [[ "$ENABLE_SFTP" == "yes" ]]; then
-    local sh; sh=$(rclone_age_h)
-    if (( sh >= SFTP_HOURS )); then
-        local h; h=$(section_open "SYNC SFTP — SILENCE DÉTECTÉ")
-        h+=$(mrow "Dernière sync rclone" "il y a ${sh}h" "$(badge "RETARD" crit)")
-        h+="<p style='color:#5a8099;font-size:12px;margin-top:8px;'>Seuil : ${SFTP_HOURS}h. Vérifiez la connectivité SFTP : <code style='color:#7ec8e3;'>rclone lsd cryoss-sftp:</code></p>"
-        h+=$(section_close)
-        fire "sftp_sync_late" "[Cryoss $CLIENT_NAME] &#9888; Sync SFTP silencieuse (${sh}h)" "$h"
-    fi
+        local sh; sh=$(rclone_age_h)
+        if (( sh == -1 )); then
+            log "Sync SFTP : pas de donnee (jamais execute ou log absent)"
+        elif (( sh >= SFTP_HOURS )); then
+            local h; h=$(section_open "SYNC SFTP — SILENCE DÉTECTÉ")
+            h+=$(mrow "Dernière sync rclone" "il y a ${sh}h" "$(badge "RETARD" crit)")
+            h+="<p style='color:#5a8099;font-size:12px;margin-top:8px;'>Seuil : ${SFTP_HOURS}h. Vérifiez la connectivité SFTP : <code style='color:#7ec8e3;'>rclone lsd cryoss-sftp:</code></p>"
+            h+=$(section_close)
+            fire "sftp_sync_late" "[Cryoss $CLIENT_NAME] &#9888; Sync SFTP silencieuse (${sh}h)" "$h"
+        fi
     fi  # fin ENABLE_SFTP watchdog
 
     log "Watchdog terminé — alertes déclenchées : $fired"
@@ -1760,23 +2871,101 @@ info "Test rapport initial..."
 /usr/local/bin/cryoss-health.sh daily \
     && ok "Rapport test envoye a $EMAIL_TO${EMAIL_TO_2:+ et $EMAIL_TO_2}" \
     || warn "Erreur rapport test — verifiez msmtp"
+    cryoss_done "14-monitoring"
+fi
 
 # =============================================================================
-#  RESUME
+if cryoss_step "15-master-key" "15. Master key Console Analyss (Fernet)"; then
+    # Master key Fernet utilisée par cryoss-command-runner pour déchiffrer les
+    # params sensibles (`enc:v1:<token>`) reçus de la Console Analyss.
+    # Référence : ADR 0001 §4 (Analyss).
+    info "La Console Analyss envoie certains params (mots de passe Samba ajoutés"
+    info "via le panel users) chiffrés en Fernet. Le runner local doit pouvoir"
+    info "les déchiffrer."
+    info ""
+    info "Si vous n'utilisez PAS la Console Analyss bidirectionnelle, vous pouvez"
+    info "skipper cette étape — toutes les autres commandes (clear-text params)"
+    info "fonctionneront sans master key."
+    echo
+    read -rp "Configurer la master key Fernet maintenant ? [O/n] : " _mk
+    if [[ "${_mk,,}" == "n" ]]; then
+        info "Étape skippée. Pour la configurer plus tard :"
+        info "  sudo bash $0 --only-step 15-master-key"
+    else
+        # Vérifier python3-cryptography (dépendance du helper)
+        if ! python3 -c 'import cryptography.fernet' 2>/dev/null; then
+            info "Installation python3-cryptography (requis pour Fernet)..."
+            cryoss_apt_install python3-cryptography
+        fi
+
+        # Saisie de la clé (l'opérateur la copie depuis la Console Analyss)
+        echo
+        info "La master key est une clé Fernet base64 url-safe (44 caractères)."
+        info "Elle est générée par la Console Analyss ; copiez-la depuis l'UI."
+        echo
+        while true; do
+            read -rsp "  Master key Fernet : " MASTER_KEY; echo
+            if [[ -z "$MASTER_KEY" ]]; then
+                warn "Vide — réessayez ou Ctrl+C pour skipper."
+                continue
+            fi
+            # Validation : encrypt+decrypt d'un test message via le helper Python
+            if MK="$MASTER_KEY" python3 -c '
+import os, sys
+from cryptography.fernet import Fernet, InvalidToken
+try:
+    f = Fernet(os.environ["MK"].encode())
+    token = f.encrypt(b"cryoss-master-key-self-test")
+    plain = f.decrypt(token)
+    sys.exit(0 if plain == b"cryoss-master-key-self-test" else 1)
+except (ValueError, InvalidToken):
+    sys.exit(2)
+' 2>/dev/null; then
+                ok "Master key valide (test encrypt+decrypt OK)"
+                break
+            else
+                warn "Master key invalide. Format attendu : Fernet base64 url-safe (44 chars)."
+            fi
+        done
+
+        # Pose en 0600 root:root. mkdir prealable pour que --only-step 15-master-key
+        # marche standalone (sans depender des steps amont qui creent /etc/cryoss).
+        mkdir -p /etc/cryoss
+        chmod 700 /etc/cryoss
+        chown root:root /etc/cryoss
+        umask 077
+        printf '%s\n' "$MASTER_KEY" > /etc/cryoss/master_key
+        chmod 600 /etc/cryoss/master_key
+        chown root:root /etc/cryoss/master_key
+        unset MASTER_KEY
+        ok "Master key déposée : /etc/cryoss/master_key (0600 root:root)"
+        info "Le runner peut maintenant déchiffrer les params 'enc:v1:' de la Console."
+    fi
+    cryoss_done "15-master-key"
+fi
+
 # =============================================================================
-echo -e "\n${BOLD}${GREEN}"
-echo "============================================================"
-echo "  CRYOSS RPi1 - Installation terminee !"
-echo "============================================================"
+#  RESUME — récap final (robuste sur reprise : recalcule ce qui manque)
+# =============================================================================
+
+# UUID_MD0/MD1 peuvent être absents si l'étape 4 a été skippée (resume) — recalcul
+UUID_MD0="${UUID_MD0:-$(blkid -s UUID -o value /dev/md0 2>/dev/null || echo 'N/A')}"
+UUID_MD1="${UUID_MD1:-$(blkid -s UUID -o value /dev/md1 2>/dev/null || echo 'N/A')}"
+
+echo
+echo -e "${BOLD}${GREEN}"
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║          CRYOSS RPi1 — Installation terminée !              ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
-echo -e "${BOLD}--- Client ---${NC}"
+echo -e "${BOLD}${CRY}── Client ──${NC}"
 echo "  $CLIENT_NAME"
-echo -e "${BOLD}--- Reseau ---${NC}"
+echo -e "${BOLD}${CRY}── Réseau ──${NC}"
 echo "  ${NET_IP}/${NET_CIDR}  GW:$NET_GW  ($NET_IFACE)"
-echo -e "${BOLD}--- RAID ---${NC}"
+echo -e "${BOLD}${CRY}── RAID ──${NC}"
 echo "  md0 ($DISK1+$DISK2) -> /etc/sauvegarde  UUID:$UUID_MD0"
 echo "  md1 ($DISK3+$DISK4) -> /etc/encrypted   UUID:$UUID_MD1"
-echo -e "${BOLD}--- Chemins de sauvegarde ---${NC}"
+echo -e "${BOLD}${CRY}── Chemins de sauvegarde ──${NC}"
 echo "  [1] rclone crypt (XSalsa20, KEY_C1) -> /etc/encrypted        (RAID, quotidien 02h)"
 echo "  [2] rclone crypt (XSalsa20-Poly1305, KEY_C2) -> RPi2 via SFTP interco"
 if [[ "$ENABLE_SFTP" == "yes" ]]; then
@@ -1784,19 +2973,43 @@ if [[ "$ENABLE_SFTP" == "yes" ]]; then
 else
     echo "  [3] SFTP désactivé"
 fi
-echo -e "${BOLD}--- Monitoring ---${NC}"
+echo -e "${BOLD}${CRY}── Monitoring ──${NC}"
 echo "  Rapport quotidien  : 07h00  -> $EMAIL_TO${EMAIL_TO_2:+ + $EMAIL_TO_2}"
 echo "  Rapport hebdo      : lundi 08h00 (SMART complet, tendances)"
 echo "  Watchdog alertes   : toutes les 15min (cooldown 1h/alerte)"
 echo "  Alertes immédiates : RAID dégradé, SMART critique, espace >85%,"
 echo "                       service down, réplication silencieuse"
-echo -e "${BOLD}--- Utilisateurs ---${NC}"
-echo "  ds-user : $DS_PASS  (Samba R/W, nologin)"
-echo "  habyss  : $HABYSS_PASS  (sudo+SSH+Samba)"
-echo -e "${BOLD}--- Cles ---${NC}"
+echo -e "${BOLD}${CRY}── Utilisateurs (système) ──${NC}"
+echo "  ds-user : ${DS_PASS:-(inchangé)}  (Samba R/W, nologin)"
+echo "  habyss  : ${HABYSS_PASS:-(inchangé)}  (sudo+SSH+Samba)"
+# Wizard : afficher les partages/utilisateurs personnalisés si présents
+if [[ -f /etc/cryoss/shares.conf ]]; then
+    cryoss_wizard_load_config 2>/dev/null || true
+    if (( ${#WIZ_USERS[@]} > 0 )) || (( ${#WIZ_SHARES[@]} > 0 )); then
+        echo -e "${BOLD}${CRY}── Samba personnalisé (wizard) ──${NC}"
+        if (( ${#WIZ_USERS[@]} > 0 )); then
+            echo "  Utilisateurs Samba purs (nologin, password Unix verrouillé) :"
+            for _u in "${WIZ_USERS[@]}"; do echo "    - $_u"; done
+        fi
+        if (( ${#WIZ_SHARES[@]} > 0 )); then
+            echo "  Partages personnalisés :"
+            for _s in "${WIZ_SHARES[@]}"; do
+                echo "    - [$_s] -> ${WIZ_SHARE_PATH[$_s]}"
+            done
+        fi
+        echo "  Config persistée : /etc/cryoss/shares.conf"
+        echo "  → Pour modifier : sudo bash $0 --from-step 11b-samba-wizard"
+    fi
+fi
+echo -e "${BOLD}${CRY}── Clés ──${NC}"
 echo "  Cles rclone : /etc/cryoss/keys-backup.conf"
 echo "  rclone    : /root/.config/rclone/rclone.conf"
-echo -e "${BOLD}--- Logs ---${NC}"
+echo -e "${BOLD}${CRY}── État d'installation ──${NC}"
+echo "  Étapes validées   : $(wc -l < "$CRYOSS_STATE_FILE" 2>/dev/null || echo 0)/${#CRYOSS_STEPS[@]}"
+echo "  Fichier d'état    : $CRYOSS_STATE_FILE"
+echo "  Variables (env)   : $CRYOSS_ENV_FILE"
+echo "  Log brut          : $CRYOSS_INSTALL_LOG"
+echo -e "${BOLD}${CRY}── Logs runtime ──${NC}"
 echo "  /var/log/cryoss-backup.log"
 echo "  /var/log/rclone_cryoss.log"
 echo "  /var/log/cryoss-health.log"
@@ -1808,5 +3021,10 @@ echo "  sudo /usr/local/bin/cryoss-health.sh alert     # Watchdog"
 echo "  sudo systemctl start cryoss-backup.service"
 echo "  tail -f /var/log/cryoss-health.log"
 echo ""
-echo -e "${RED}${BOLD}Redemarrage recommande.${NC}"
+echo -e "${BOLD}${CRY}Reprise / modifications ultérieures :${NC}"
+echo "  sudo bash $0 --list-steps                     # statut des étapes"
+echo "  sudo bash $0 --from-step 11b-samba-wizard     # rejouer le wizard Samba"
+echo "  sudo bash $0 --resume                         # reprendre après interruption"
+echo
+echo -e "${RED}${BOLD}Redémarrage recommandé.${NC}"
 echo

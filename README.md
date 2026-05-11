@@ -2,7 +2,7 @@
 
 **Sauvegarde triple-redondante chiffree pour PME -- by Analyss**
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.1.0-blue)
 ![License](https://img.shields.io/badge/licence-proprietaire-red)
 ![Tests](https://img.shields.io/badge/tests-62%20passed-brightgreen)
 
@@ -52,19 +52,24 @@
 
 ## Installation rapide
 
+> ⚠ **Pre-requis RPi 5 + Penta SATA HAT** : ajouter `dtparam=pciex1` dans
+> `/boot/firmware/config.txt` puis rebooter, **avant** le premier `install_rpi1.sh`.
+> Sans ca, les disques ne sont pas detectes. Voir
+> [docs/ops/DEPLOYMENT.md](docs/ops/DEPLOYMENT.md) section 2bis.
+
 Executer dans l'ordre sur les equipements cibles :
 
 ```bash
-# 1. Installation RPi1 (orchestrateur)
-sudo bash install_rpi1.sh
-
-# 2. Installation RPi2 (air-gapped)
+# 1. Installation RPi2 (air-gapped) — A FAIRE EN PREMIER
 sudo bash install_rpi2.sh
 
-# 3. Securisation (anti-ransomware, AppArmor, honeypot)
+# 2. Installation RPi1 (orchestrateur)
+sudo bash install_rpi1.sh
+
+# 3. Securisation (anti-ransomware, AppArmor, honeypot) — RPi1 uniquement
 sudo bash install_security.sh
 
-# 4. API de monitoring (FastAPI)
+# 4. API de monitoring (FastAPI) — sur les deux RPi
 sudo bash install_api.sh
 ```
 
@@ -73,6 +78,26 @@ Apres installation, valider avec :
 ```bash
 sudo bash test_installation.sh
 ```
+
+### install_rpi1.sh — modes avances
+
+Le script est decoupe en 15 etapes avec checkpoints persistants. Chaque etape
+peut etre rejouee independamment, ce qui evite de tout recommencer en cas
+d'interruption ou de modification :
+
+```bash
+sudo bash install_rpi1.sh --list-steps              # statut des etapes
+sudo bash install_rpi1.sh --resume                  # reprendre apres interruption
+sudo bash install_rpi1.sh --from-step 11-samba      # repartir a une etape
+sudo bash install_rpi1.sh --only-step 11b-samba-wizard  # rejouer UNE etape
+sudo bash install_rpi1.sh --reset                   # tout effacer
+sudo bash install_rpi1.sh --help                    # aide
+```
+
+L'**etape 11b** est un wizard interactif qui cree des partages Samba
+personnalises avec des **utilisateurs Samba purs** (nologin + Unix verrouille,
+jamais de shell ni d'acces SSH) et une matrice de droits R/RW/refus par
+(partage × utilisateur).
 
 ## Scripts principaux
 

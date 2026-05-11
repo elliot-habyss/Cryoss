@@ -1,0 +1,15 @@
+# Cryoss — config ShellCheck
+# Exécuté par .github/workflows/security.yml
+
+# SC1091 : impossible de suivre `source` non-constant (ex. /etc/cryoss/...)
+disable=SC1091
+
+# SC2034 : variable assignée non utilisée (faux positif fréquent sur les
+# couleurs ANSI déclarées en haut de chaque script)
+disable=SC2034
+
+# Forcer bash externe (pas /bin/sh)
+shell=bash
+
+# Severity minimum
+severity=warning

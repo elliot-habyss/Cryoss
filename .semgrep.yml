@@ -1,0 +1,140 @@
+rules:
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Python — règles Cryoss spécifiques
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: cryoss-shell-true-with-fstring
+    languages: [python]
+    severity: ERROR
+    message: |
+      subprocess avec shell=True et f-string interpolée — risque RCE.
+      Utiliser shell=False et passer une liste d'arguments.
+    pattern-either:
+      - pattern: subprocess.run(f"...", shell=True, ...)
+      - pattern: subprocess.Popen(f"...", shell=True, ...)
+      - pattern: subprocess.call(f"...", shell=True, ...)
+      - pattern: subprocess.check_output(f"...", shell=True, ...)
+    paths:
+      include:
+        - "api/**/*.py"
+
+  - id: cryoss-shell-true-with-format
+    languages: [python]
+    severity: ERROR
+    message: |
+      subprocess avec shell=True et .format() ou % — risque RCE.
+    pattern-either:
+      - pattern: subprocess.run("...".format(...), shell=True, ...)
+      - pattern: subprocess.run("..." % ..., shell=True, ...)
+    paths:
+      include:
+        - "api/**/*.py"
+
+  - id: cryoss-bind-non-localhost
+    languages: [python]
+    severity: ERROR
+    message: |
+      L'API Cryoss DOIT bind sur 127.0.0.1, jamais 0.0.0.0 (cf. threat model).
+    pattern-either:
+      - pattern: uvicorn.run(..., host="0.0.0.0", ...)
+      - pattern: app.run(..., host="0.0.0.0", ...)
+      - pattern: |
+          API_HOST = "0.0.0.0"
+    paths:
+      include:
+        - "api/**/*.py"
+
+  - id: cryoss-cors-allow-all
+    languages: [python]
+    severity: ERROR
+    message: |
+      CORS allow_origins=["*"] expose l'API à toute origine.
+      Cryoss bind localhost — n'activez pas CORS.
+    pattern: |
+      $APP.add_middleware(CORSMiddleware, allow_origins=["*"], ...)
+
+  - id: cryoss-pickle-load
+    languages: [python]
+    severity: ERROR
+    message: pickle.load sur entrée non-fiable = RCE. Utiliser JSON.
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: cPickle.load(...)
+
+  - id: cryoss-yaml-unsafe-load
+    languages: [python]
+    severity: ERROR
+    message: yaml.load sans Loader=SafeLoader = RCE. Utiliser yaml.safe_load.
+    pattern-either:
+      - pattern: yaml.load($X)
+      - pattern: yaml.load($X, Loader=yaml.Loader)
+      - pattern: yaml.load($X, Loader=yaml.FullLoader)
+
+  - id: cryoss-weak-hash
+    languages: [python]
+    severity: WARNING
+    message: |
+      MD5/SHA1 ne sont pas adaptés pour des usages sécurité.
+      Pour comparer secrets/tokens, utiliser hashlib.sha256 + hmac.compare_digest.
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+    pattern-not-inside: |
+      # cas légitime : checksum non-sécurité
+      $... = hashlib.md5(..., usedforsecurity=False)
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Bash — règles Cryoss spécifiques
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: cryoss-bash-source-untrusted
+    languages: [bash]
+    severity: WARNING
+    message: |
+      `source` exécute le contenu — RCE si le fichier est compromis.
+      Préférer un parser strict KEY=value validé par regex.
+    pattern-either:
+      - pattern: source $FILE
+      - pattern: . $FILE
+
+  - id: cryoss-bash-eval
+    languages: [bash]
+    severity: ERROR
+    message: |
+      `eval` avec entrée non-littérale = RCE. À éviter.
+    pattern-either:
+      - pattern: eval $CMD
+      - pattern: eval "$CMD"
+
+  - id: cryoss-curl-insecure
+    languages: [bash]
+    severity: ERROR
+    message: |
+      curl -k / --insecure désactive la vérification TLS.
+      Le heartbeat Cryoss DOIT vérifier le certificat Analyss.
+    pattern-either:
+      - pattern: curl ... -k ...
+      - pattern: curl ... --insecure ...
+      - pattern: wget ... --no-check-certificate ...
+
+  - id: cryoss-ssh-no-strict-host
+    languages: [bash]
+    severity: WARNING
+    message: |
+      StrictHostKeyChecking=no désactive la vérification — risque MITM.
+      Utiliser `accept-new` au pire (TOFU), ou pinner la clé.
+    pattern: ssh ... -o "StrictHostKeyChecking=no" ...
+
+  - id: cryoss-rm-rf-var
+    languages: [bash]
+    severity: ERROR
+    message: |
+      `rm -rf $VAR` — si $VAR est vide, supprime depuis la racine.
+      Quoter strictement et valider que $VAR n'est pas vide.
+    pattern-either:
+      - pattern: rm -rf $VAR
+      - pattern: rm -rf $VAR/...
+    pattern-not-inside: |
+      [[ -n "$VAR" ]] && ...

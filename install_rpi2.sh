@@ -243,7 +243,17 @@ chown root:root /etc/encrypted
 chmod 751 /etc/encrypted
 chown ds-repl:ds-repl "$RPI2_DIR"
 chmod 750 "$RPI2_DIR"
-ok "Permissions OK (encrypted:751, rpi1:750 ds-repl)"
+
+# Ajouter habyss au groupe ds-repl pour permettre le monitoring heartbeat
+# (le script cryoss-heartbeat.sh sur RPi1 fait SSH habyss@RPi2 pour lister
+#  les fichiers recus). Sans ca, habyss ne peut pas lire /etc/encrypted/rpi1.
+# Les fichiers eux-memes restent owned par ds-repl avec les permissions
+# definies par rclone (obfuscation des noms = protection additionnelle).
+usermod -aG ds-repl habyss 2>/dev/null && \
+    ok "habyss ajoute au groupe ds-repl (lecture reception pour monitoring)" || \
+    warn "Echec ajout habyss au groupe ds-repl - monitoring RPi2 peut voir 0 fichier"
+
+ok "Permissions OK (encrypted:751, rpi1:750 ds-repl, habyss in ds-repl)"
 
 # =============================================================================
 step "6. Acces SFTP-only pour ds-repl (rclone depuis RPi1)"
@@ -375,6 +385,11 @@ ok "Regle UFW LAN sera auto-supprimee dans 2h (cryoss-ufw-cleanup.timer)"
 
 # Fail2Ban
 cat > /etc/fail2ban/jail.d/99-cryoss.conf <<F2B_EOF
+[DEFAULT]
+# Ne jamais bannir le RPi1 (lien interco Cryoss) - sinon la reception des
+# replications casse et il faut console physique pour reparer
+ignoreip = 127.0.0.1/8 ::1 ${INTERCO_IP_RPI1}/32
+
 [sshd]
 enabled=true
 port=ssh
@@ -383,7 +398,7 @@ bantime=3600
 findtime=600
 F2B_EOF
 systemctl enable fail2ban; systemctl restart fail2ban
-ok "Fail2Ban configure"
+ok "Fail2Ban configure (RPi1 ${INTERCO_IP_RPI1} whitelisted)"
 
 for SVC in bluetooth avahi-daemon cups triggerhappy; do
     systemctl disable --now "$SVC" 2>/dev/null && warn "$SVC desactive" || true
@@ -446,32 +461,221 @@ chmod 600 /etc/msmtprc; chown root:root /etc/msmtprc
 ok "msmtp configuré — relais via RPi1 (${INTERCO_IP_RPI1}:25)"
 warn "RPi1 doit avoir le relais SMTP activé (install_rpi1.sh configure postfix/msmtp-relay)"
 
+# Librairie email HTML partagee (meme contenu que sur RPi1)
+mkdir -p /usr/local/lib
+cat > /usr/local/lib/cryoss-email.sh << 'EMAILLIB_EOF'
+#!/usr/bin/env bash
+# CRYOSS - Librairie templates email HTML (partagee RPi1/RPi2)
+
+: "${CLIENT_NAME:=CRYOSS}"
+: "${EMAIL_TO:=}"
+: "${EMAIL_TO_2:=}"
+: "${HOSTNAME_VAL:=$(hostname 2>/dev/null || echo unknown)}"
+: "${LOG:=/var/log/cryoss-email.log}"
+
+_tshort() { date '+%d/%m/%Y %H:%M'; }
+
+_elog() {
+    [[ -n "${LOG:-}" ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] [email] $1" >> "$LOG" 2>/dev/null || true
+}
+
+badge() {
+    local lbl="$1" t="$2"
+    case "$t" in
+        ok)   echo "<span style='background:#ecfdf5;color:#059669;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #a7f3d0;'>$lbl</span>" ;;
+        warn) echo "<span style='background:#fffbeb;color:#d97706;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #fde68a;'>$lbl</span>" ;;
+        crit) echo "<span style='background:#fef2f2;color:#dc2626;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #fecaca;'>$lbl</span>" ;;
+        info) echo "<span style='background:#eef2ff;color:#6366f1;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #c7d2fe;'>$lbl</span>" ;;
+        *)    echo "<span style='background:#f1f5f9;color:#475569;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #cbd5e1;'>$lbl</span>" ;;
+    esac
+}
+
+section_open() {
+    echo "<table width='100%' cellpadding='0' cellspacing='0' style='margin-bottom:18px;'><tr><td style='padding-bottom:7px;border-bottom:1px solid #e2e8f0;'><span style='color:#2563eb;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;'>$1</span></td></tr><tr><td style='padding-top:10px;'><table width='100%' cellpadding='0' cellspacing='0'>"
+}
+section_close() { echo "</table></td></tr></table>"; }
+
+mrow() {
+    echo "<tr><td style='padding:5px 0;color:#64748b;font-size:13px;width:48%;'>$1</td><td style='padding:5px 0;color:#1e293b;font-size:13px;font-weight:600;'>$2 $3</td></tr>"
+}
+
+alert_banner() {
+    local msg="$1" type="${2:-crit}"
+    case "$type" in
+        ok)   echo "<div style='background:#f0fdf4;border-left:4px solid #059669;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#059669;font-weight:700;font-size:14px;'>&#10003; $msg</span></div>" ;;
+        warn) echo "<div style='background:#fffbeb;border-left:4px solid #d97706;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#d97706;font-weight:700;font-size:14px;'>&#9888; $msg</span></div>" ;;
+        info) echo "<div style='background:#eff6ff;border-left:4px solid #2563eb;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#2563eb;font-weight:700;font-size:14px;'>&#8505; $msg</span></div>" ;;
+        crit|*) echo "<div style='background:#fef2f2;border-left:4px solid #dc2626;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#dc2626;font-weight:700;font-size:14px;'>&#9888; $msg</span></div>" ;;
+    esac
+}
+
+code_block() {
+    echo "<pre style='font-family:monospace;font-size:11px;color:#1e293b;background:#f1f5f9;padding:10px;border-radius:5px;overflow-x:auto;margin:6px 0;white-space:pre-wrap;word-break:break-all;border:1px solid #e2e8f0;'>$1</pre>"
+}
+
+wrap_email() {
+    local title="$1" body="$2" accent="${3:-info}"
+    local accent_color
+    case "$accent" in
+        ok)   accent_color="#059669" ;;
+        warn) accent_color="#d97706" ;;
+        crit) accent_color="#dc2626" ;;
+        *)    accent_color="#2563eb" ;;
+    esac
+    cat << TMPL
+<!DOCTYPE html>
+<html lang="fr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f8f9fa;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f8f9fa;">
+<tr><td align="center" style="padding:28px 12px;">
+<table width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;background:#ffffff;border-radius:8px;border:1px solid #e2e8f0;overflow:hidden;">
+  <tr><td style="background:#ffffff;padding:24px 36px;border-bottom:2px solid ${accent_color};">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td><span style="font-size:20px;font-weight:800;color:#1e293b;letter-spacing:1px;">CRYOSS</span>
+      <p style="margin:4px 0 0;color:#64748b;font-size:11px;letter-spacing:2px;text-transform:uppercase;">Monitoring</p></td>
+      <td align="right" valign="middle"><span style="background:#eff6ff;border:1px solid ${accent_color};color:${accent_color};padding:5px 13px;border-radius:16px;font-size:12px;font-weight:700;letter-spacing:1px;">${CLIENT_NAME}</span></td>
+    </tr></table>
+  </td></tr>
+  <tr><td style="padding:24px 36px 6px;">
+    <h1 style="margin:0;color:#1e293b;font-size:18px;font-weight:700;">${title}</h1>
+    <p style="margin:5px 0 0;color:#64748b;font-size:12px;">$(_tshort) &nbsp;&bull;&nbsp; ${HOSTNAME_VAL}</p>
+  </td></tr>
+  <tr><td style="padding:14px 36px 28px;">${body}</td></tr>
+  <tr><td style="background:#f8f9fa;padding:16px 36px;border-top:1px solid #e2e8f0;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td style="color:#94a3b8;font-size:11px;">Cryoss &copy; <a href="https://analyss.fr" style="color:#2563eb;text-decoration:none;">Analyss</a> &mdash; Rapport automatique</td>
+      <td align="right"><a href="https://analyss.fr" style="color:#2563eb;font-size:11px;text-decoration:none;">analyss.fr</a></td>
+    </tr></table>
+  </td></tr>
+</table></td></tr></table>
+</body></html>
+TMPL
+}
+
+send_html_email() {
+    local subject="$1" full_html="$2"
+    local rc=0
+    for DEST in "$EMAIL_TO" "$EMAIL_TO_2"; do
+        [[ -z "$DEST" ]] && continue
+        {
+            echo "To: $DEST"
+            echo "Subject: $subject"
+            echo "MIME-Version: 1.0"
+            echo "Content-Type: text/html; charset=UTF-8"
+            echo ""
+            echo "$full_html"
+        } | msmtp "$DEST" 2>/dev/null || { _elog "WARN: email vers $DEST echoue"; rc=1; }
+    done
+    return $rc
+}
+
+send_email_wrapped() {
+    local subject="$1" title="$2" body="$3" accent="${4:-info}"
+    local full_html
+    full_html=$(wrap_email "$title" "$body" "$accent")
+    send_html_email "$subject" "$full_html"
+}
+EMAILLIB_EOF
+chmod 644 /usr/local/lib/cryoss-email.sh
+chown root:root /usr/local/lib/cryoss-email.sh
+ok "Librairie email HTML installee : /usr/local/lib/cryoss-email.sh"
+
 cat > /usr/local/bin/cryoss-health.sh << 'HEALTH_EOF'
 #!/bin/bash
 # CRYOSS - Monitoring sante RPi2
 set -euo pipefail
 
 EMAIL_TO="DS_EMAIL_TO"
+EMAIL_TO_2=""
 CLIENT_NAME="DS_CLIENT_NAME"
 RPI1_IP="DS_RPI1_IP"
 RPI2_DIR="DS_RPI2_DIR"
 LOG="/var/log/cryoss-health.log"
 MODE="${1:-daily}"
 HOSTNAME_SHORT=$(hostname -s)
+HOSTNAME_VAL="$HOSTNAME_SHORT"
 DATE_LABEL=$(date '+%d/%m/%Y %H:%M')
 ANOMALIES=()
 REPORT=""
+# Collecte HTML structure (sections/mrows) pour email HTML
+HTML_SECTIONS=""
+_current_section=""
+_current_rows=""
+
+# Sourcer la librairie email HTML partagee si presente
+if [[ -f /usr/local/lib/cryoss-email.sh ]]; then
+    # shellcheck source=/usr/local/lib/cryoss-email.sh
+    source /usr/local/lib/cryoss-email.sh
+fi
 
 log()       { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
-section()   { REPORT="${REPORT}\n$(printf '=%.0s' {1..50})\n  $1\n$(printf '=%.0s' {1..50})\n"; }
+
+# Section text + HTML
+section() {
+    REPORT="${REPORT}\n$(printf '=%.0s' {1..50})\n  $1\n$(printf '=%.0s' {1..50})\n"
+    # Cloturer la section HTML precedente s'il y en a une
+    if [[ -n "$_current_section" ]]; then
+        if declare -F section_open &>/dev/null; then
+            HTML_SECTIONS+="$(section_open "$_current_section")$_current_rows$(section_close)"
+        fi
+    fi
+    _current_section="$1"
+    _current_rows=""
+}
+
+# Ajout d'une ligne text + HTML mrow
+_add_row() {
+    local status="$1" content="$2"
+    local html_badge=""
+    case "$status" in
+        ok)   html_badge=$(declare -F badge &>/dev/null && badge "OK" ok) ;;
+        warn) html_badge=$(declare -F badge &>/dev/null && badge "ATTENTION" warn) ;;
+        info) html_badge="" ;;
+    esac
+    if declare -F mrow &>/dev/null; then
+        _current_rows+="$(mrow "$content" "" "$html_badge")"
+    fi
+}
+
 line()      { REPORT="${REPORT}$1\n"; }
 alert()     { ANOMALIES+=("$1"); log "ANOMALIE: $1"; }
-ok_line()   { line "  [OK]  $1"; }
-warn_line() { line "  [!!]  $1"; alert "$1"; }
-info_line() { line "  [--]  $1"; }
+ok_line()   { line "  [OK]  $1"; _add_row ok "$1"; }
+warn_line() { line "  [!!]  $1"; alert "$1"; _add_row warn "$1"; }
+info_line() { line "  [--]  $1"; _add_row info "$1"; }
+
+# Finaliser la derniere section avant envoi
+_close_html_sections() {
+    if [[ -n "$_current_section" ]] && declare -F section_open &>/dev/null; then
+        HTML_SECTIONS+="$(section_open "$_current_section")$_current_rows$(section_close)"
+        _current_section=""
+        _current_rows=""
+    fi
+}
 
 send_mail() {
     local subject="$1" body="$2"
+    # Envoi HTML si la lib est disponible
+    if declare -F send_email_wrapped &>/dev/null && [[ -n "$HTML_SECTIONS" ]]; then
+        _close_html_sections
+        local accent="ok"
+        [[ ${#ANOMALIES[@]} -gt 0 ]] && accent="warn"
+        local banner
+        if [[ ${#ANOMALIES[@]} -eq 0 ]]; then
+            banner=$(alert_banner "Monitoring RPi2 — tout est sain" "ok")
+        else
+            banner=$(alert_banner "Monitoring RPi2 — ${#ANOMALIES[@]} anomalie(s) detectee(s)" "warn")
+        fi
+        local html_body="${banner}${HTML_SECTIONS}"
+        local title_mode
+        case "$MODE" in
+            daily)  title_mode="Rapport quotidien" ;;
+            weekly) title_mode="Rapport hebdomadaire" ;;
+            *)      title_mode="Rapport $MODE" ;;
+        esac
+        send_email_wrapped "$subject" "RPi2 — $title_mode" "$html_body" "$accent" && return 0
+    fi
+    # Fallback plain text
     { echo "To: $EMAIL_TO"; echo "Subject: $subject"; echo ""; echo -e "$body"; } \
         | msmtp "$EMAIL_TO" 2>/dev/null || log "WARN: email non envoye"
 }
@@ -638,10 +842,34 @@ build_report() {
 
 send_alerts() {
     [[ ${#ANOMALIES[@]} -eq 0 ]] && return
+    local subject="[ALERTE RPi2 $CLIENT_NAME] ${#ANOMALIES[@]} anomalie(s) - $DATE_LABEL"
+
+    # Version HTML si la lib est chargee
+    if declare -F send_email_wrapped &>/dev/null; then
+        local banner html_body
+        banner=$(alert_banner "${#ANOMALIES[@]} anomalie(s) detectee(s) sur le RPi2 de replication" "crit")
+        html_body="$banner"
+        html_body+=$(section_open "ANOMALIES DETECTEES")
+        for A in "${ANOMALIES[@]}"; do
+            html_body+=$(mrow "$A" "" "$(badge "A TRAITER" warn)")
+        done
+        html_body+=$(section_close)
+        html_body+=$(section_open "CONTEXTE")
+        html_body+=$(mrow "Hote" "$HOSTNAME_SHORT" "")
+        html_body+=$(mrow "Mode" "$MODE" "")
+        html_body+=$(mrow "Liaison RPi1" "$RPI1_IP" "")
+        html_body+=$(mrow "Repertoire reception" "$RPI2_DIR" "")
+        html_body+=$(section_close)
+        send_email_wrapped "$subject" "Alerte RPi2 — ${#ANOMALIES[@]} anomalie(s)" "$html_body" "crit" \
+            && { log "Alerte envoyee (HTML)"; return 0; }
+    fi
+
+    # Fallback plain text
     local body="ALERTE CRYOSS RPi2 [$CLIENT_NAME] - $DATE_LABEL\n\n${#ANOMALIES[@]} anomalie(s) :\n\n"
     for A in "${ANOMALIES[@]}"; do body="${body}  >> $A\n"; done
-    send_mail "[ALERTE RPi2 $CLIENT_NAME] ${#ANOMALIES[@]} anomalie(s) - $DATE_LABEL" "$body"
-    log "Alerte envoyee"
+    { echo "To: $EMAIL_TO"; echo "Subject: $subject"; echo ""; echo -e "$body"; } \
+        | msmtp "$EMAIL_TO" 2>/dev/null || log "WARN: alerte non envoyee"
+    log "Alerte envoyee (plain)"
 }
 
 log "=== Monitoring RPi2 [$MODE] ==="

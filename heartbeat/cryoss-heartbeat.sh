@@ -155,8 +155,8 @@ get_cpu_temp() {
         local raw
         raw=$(cat "$temp_file" 2>/dev/null)
         if [[ -n "$raw" ]]; then
-            # La valeur est en millidegres, on convertit en degres avec 1 decimale
-            echo "scale=1; $raw / 1000" | bc 2>/dev/null || echo "0"
+            # Conversion millidegres -> degres via awk (toujours dispo, pas bc)
+            awk -v v="$raw" 'BEGIN{printf "%.1f", v/1000}' 2>/dev/null || echo "0"
             return
         fi
     fi
@@ -177,6 +177,15 @@ get_ram_info() {
 # Uptime lisible
 get_uptime() {
     uptime -p 2>/dev/null || uptime 2>/dev/null | sed 's/.*up /up /' | sed 's/,.*//'
+}
+
+# Nettoyer une valeur pour insertion dans un JSON string :
+# - supprime les caracteres de controle (qui causent "Invalid control character")
+# - supprime les quotes (evite de casser le JSON)
+# - supprime les backslashes (evite les echappements malform)
+# - trim les espaces/newlines en debut et fin
+_clean_json_string() {
+    printf '%s' "$1" | tr -d '\000-\037' | sed 's/["\\]//g' | awk '{$1=$1}1' | tr -d '\n'
 }
 
 # -----------------------------------------------------------------------------
@@ -287,21 +296,60 @@ get_services_json() {
 
 # -----------------------------------------------------------------------------
 # Informations de backup (RPi1)
+# Source de verite : manifeste JSON ecrit par cryoss-backup.sh a chaque run.
+# Fonctionne pour les runs systemd ET manuels (CLI).
+# Fallback 1 : parser le log /var/log/cryoss-backup.log (ligne "Bilan")
+# Fallback 2 : journalctl (systemd uniquement)
 # -----------------------------------------------------------------------------
 get_backup_json_rpi1() {
     local last_run="" last_status="unknown" archive_count=0
+    local c1_status="unknown" c2_status="unknown" c3_status="unknown" restore_status="unknown"
 
-    # Derniere execution du backup depuis le journal systemd
-    last_run=$(journalctl -u cryoss-backup.service --no-pager -n 1 \
-        --output=short-iso 2>/dev/null | head -1 | awk '{print $1}')
+    # 1. Source primaire : manifeste JSON le plus recent
+    local latest_manifest
+    latest_manifest=$(ls -t /var/lib/cryoss/manifests/manifest-*.json 2>/dev/null | head -1)
+    if [[ -n "$latest_manifest" && -f "$latest_manifest" ]]; then
+        # Nettoyer chaque champ pour eviter les caracteres de controle
+        last_run=$(_clean_json_string "$(grep -oP '"timestamp"\s*:\s*"\K[^"]*' "$latest_manifest" 2>/dev/null | head -1)")
+        c1_status=$(_clean_json_string "$(grep -oP '"c1_status"\s*:\s*"\K[^"]*' "$latest_manifest" 2>/dev/null | head -1)")
+        c2_status=$(_clean_json_string "$(grep -oP '"c2_status"\s*:\s*"\K[^"]*' "$latest_manifest" 2>/dev/null | head -1)")
+        c3_status=$(_clean_json_string "$(grep -oP '"c3_status"\s*:\s*"\K[^"]*' "$latest_manifest" 2>/dev/null | head -1)")
+        restore_status=$(_clean_json_string "$(grep -oP '"restore_test"\s*:\s*"\K[^"]*' "$latest_manifest" 2>/dev/null | head -1)")
 
-    # Dernier statut : chercher dans le journal
-    local last_log
-    last_log=$(journalctl -u cryoss-backup.service --no-pager -n 20 2>/dev/null)
-    if echo "$last_log" | grep -qi "success\|completed\|termine"; then
-        last_status="success"
-    elif echo "$last_log" | grep -qi "error\|fail\|echec"; then
-        last_status="error"
+        # Determiner le statut global
+        # "success" uniquement si C1 et C2 OK et restore non-echec
+        # (C3 peut etre desactive, on l'ignore dans ce cas)
+        if [[ "$c1_status" == "ok" && "$c2_status" == "ok" ]] \
+           && [[ "$restore_status" != "echec-hash" && "$restore_status" != "echec-rclone" ]]; then
+            last_status="success"
+        elif [[ "$c1_status" == "error" || "$c2_status" == "error" || "$restore_status" == "echec-hash" ]]; then
+            last_status="error"
+        fi
+    fi
+
+    # 2. Fallback : parser le log /var/log/cryoss-backup.log (ligne "Bilan")
+    if [[ "$last_status" == "unknown" ]] && [[ -f "/var/log/cryoss-backup.log" ]]; then
+        local bilan_line
+        bilan_line=$(grep "======== Bilan" /var/log/cryoss-backup.log 2>/dev/null | tail -1)
+        if [[ -n "$bilan_line" ]]; then
+            # Timestamp au debut de la ligne : [2026-04-17 08:53:41]
+            if [[ -z "$last_run" ]]; then
+                last_run=$(echo "$bilan_line" | grep -oP '^\[\K[^]]*' | sed 's/ /T/')
+            fi
+            local total
+            total=$(echo "$bilan_line" | grep -oP 'total=\K[0-9]+')
+            if [[ "$total" == "0" ]]; then
+                last_status="success"
+            elif [[ -n "$total" ]]; then
+                last_status="error"
+            fi
+        fi
+    fi
+
+    # 3. Dernier fallback : journalctl pour le timestamp si rien trouve
+    if [[ -z "$last_run" ]]; then
+        last_run=$(journalctl -u cryoss-backup.service --no-pager -n 1 \
+            --output=short-iso 2>/dev/null | head -1 | awk '{print $1}')
     fi
 
     # Nombre d'archives dans /etc/encrypted
@@ -309,7 +357,7 @@ get_backup_json_rpi1() {
         archive_count=$(find /etc/encrypted -maxdepth 1 -type f 2>/dev/null | wc -l)
     fi
 
-    echo "{\"last_run\":\"${last_run}\",\"last_status\":\"${last_status}\",\"archive_count\":${archive_count}}"
+    echo "{\"last_run\":\"${last_run}\",\"last_status\":\"${last_status}\",\"archive_count\":${archive_count},\"c1_status\":\"${c1_status}\",\"c2_status\":\"${c2_status}\",\"c3_status\":\"${c3_status}\",\"restore_test\":\"${restore_status}\"}"
 }
 
 # -----------------------------------------------------------------------------
@@ -318,7 +366,13 @@ get_backup_json_rpi1() {
 # RPi1 collecte ses donnees et les inclut dans son propre heartbeat.
 # -----------------------------------------------------------------------------
 get_rpi2_full_json() {
-    local SSH="ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no habyss@${RPI2_IP}"
+    # Specifier explicitement la cle SSH - sinon SSH cherche dans les defaults
+    # de l'utilisateur qui lance le script (root via systemd). La cle cryoss_rpi2
+    # est dans /root/.ssh/ et n'est pas un nom par defaut (id_rsa, id_ed25519).
+    local SSH_KEY="/root/.ssh/cryoss_rpi2"
+    local SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no"
+    [[ -f "$SSH_KEY" ]] && SSH_OPTS="-i $SSH_KEY $SSH_OPTS"
+    local SSH="ssh $SSH_OPTS habyss@${RPI2_IP}"
 
     # Test de connectivite
     local ping_result
@@ -458,28 +512,33 @@ get_rclone_remotes_json() {
 build_heartbeat_payload() {
     local role="$1"
     local serial
-    serial=$(get_serial)
+    serial=$(_clean_json_string "$(get_serial)")
 
     local hostname_val
-    hostname_val=$(hostname 2>/dev/null || echo "unknown")
+    hostname_val=$(_clean_json_string "$(hostname 2>/dev/null || echo unknown)")
 
     local timestamp
     timestamp=$(date '+%Y-%m-%dT%H:%M:%S')
 
     local uptime_val
-    uptime_val=$(get_uptime)
+    uptime_val=$(_clean_json_string "$(get_uptime)")
 
     local cpu_temp
-    cpu_temp=$(get_cpu_temp)
+    cpu_temp=$(_clean_json_string "$(get_cpu_temp)")
+    # Si cpu_temp n'est pas un nombre valide, fallback 0
+    [[ "$cpu_temp" =~ ^[0-9]+(\.[0-9]+)?$ ]] || cpu_temp="0"
 
     local load_1m
-    load_1m=$(get_load_1m)
+    load_1m=$(_clean_json_string "$(get_load_1m)")
+    [[ "$load_1m" =~ ^[0-9]+(\.[0-9]+)?$ ]] || load_1m="0"
 
     local ram_info
     ram_info=$(get_ram_info)
     local ram_used ram_total
-    ram_used=$(echo "$ram_info" | awk '{print $1}')
-    ram_total=$(echo "$ram_info" | awk '{print $2}')
+    ram_used=$(_clean_json_string "$(echo "$ram_info" | awk '{print $1}')")
+    ram_total=$(_clean_json_string "$(echo "$ram_info" | awk '{print $2}')")
+    [[ "$ram_used" =~ ^[0-9]+$ ]] || ram_used="0"
+    [[ "$ram_total" =~ ^[0-9]+$ ]] || ram_total="0"
 
     local raid_json
     raid_json=$(get_raid_json)
@@ -529,10 +588,94 @@ JSON
   \"rpi2\": ${rpi2_json}"
     fi
 
+    # Flag compromised (honeypot declenche)
+    # /var/lib/cryoss/compromised existe si le honeypot a detecte un incident
+    local compromised_json='{"active":false}'
+    if [[ -f /var/lib/cryoss/compromised ]]; then
+        local cmp_ts cmp_event cmp_sentinel
+        cmp_ts=$(_clean_json_string "$(grep -oP '^timestamp=\K.*' /var/lib/cryoss/compromised 2>/dev/null | head -1)")
+        cmp_event=$(_clean_json_string "$(grep -oP '^event=\K.*' /var/lib/cryoss/compromised 2>/dev/null | head -1)")
+        cmp_sentinel=$(_clean_json_string "$(grep -oP '^sentinel=\K.*' /var/lib/cryoss/compromised 2>/dev/null | head -1)")
+        compromised_json="{\"active\":true,\"detected_at\":\"${cmp_ts}\",\"event\":\"${cmp_event}\",\"sentinel\":\"${cmp_sentinel}\"}"
+    fi
+    payload+=",
+  \"compromised\": ${compromised_json}"
+
     payload+="
 }"
 
     echo "$payload"
+}
+
+# -----------------------------------------------------------------------------
+# Traitement des commandes envoyees par Analyss (bidirectionnel)
+#
+# Format attendu dans la reponse du heartbeat :
+#   {
+#     "status": "ok",
+#     "pending_commands": [
+#       {"id": "uuid-1", "type": "backup_now", "params": {}},
+#       {"id": "uuid-2", "type": "restart_service", "params": {"service": "smbd"}}
+#     ]
+#   }
+#
+# Chaque commande est dispatchee vers cryoss-command-runner.sh qui ACK le resultat.
+# -----------------------------------------------------------------------------
+process_pending_commands() {
+    local response_body="$1"
+
+    # Pas de pending_commands dans la reponse ?
+    if ! echo "$response_body" | grep -q '"pending_commands"'; then
+        return 0
+    fi
+
+    # Parser les commandes avec python (plus robuste que grep/sed pour JSON)
+    if ! command -v python3 &>/dev/null; then
+        log_warn "python3 absent - pending_commands ignorees"
+        return 0
+    fi
+
+    # Extraire les commandes ligne par ligne : id<TAB>type<TAB>params_json
+    local commands
+    commands=$(echo "$response_body" | python3 -c '
+import sys, json
+try:
+    data = json.loads(sys.stdin.read())
+    cmds = data.get("pending_commands", []) or []
+    for c in cmds:
+        cid = c.get("id", "")
+        ctype = c.get("type", "")
+        params = json.dumps(c.get("params", {}))
+        # Escape tabs in output
+        print(f"{cid}\t{ctype}\t{params}")
+except Exception as e:
+    sys.stderr.write(f"parse_error: {e}\n")
+' 2>/dev/null)
+
+    if [[ -z "$commands" ]]; then
+        return 0
+    fi
+
+    # Verifier que le runner existe
+    local runner="/usr/local/bin/cryoss-command-runner.sh"
+    if [[ ! -x "$runner" ]]; then
+        log_warn "Runner absent ($runner) - commandes ignorees"
+        return 0
+    fi
+
+    # Dispatcher chaque commande (en background pour ne pas bloquer le heartbeat)
+    local count=0
+    while IFS=$'\t' read -r cid ctype cparams; do
+        [[ -z "$cid" || -z "$ctype" ]] && continue
+        log_info "Dispatch commande : id=$cid type=$ctype"
+        # Lancer en background : le runner ACK de son cote, le heartbeat continue
+        ( "$runner" "$cid" "$ctype" "$cparams" >/dev/null 2>&1 ) &
+        ((count++)) || true
+    done <<< "$commands"
+
+    if (( count > 0 )); then
+        log_info "$count commande(s) dispatch-ee(s) en background"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -541,6 +684,15 @@ JSON
 send_heartbeat() {
     local payload="$1"
     local endpoint="${ANALYSS_URL}/api/sync/cryoss/heartbeat"
+
+    # Validation JSON avant envoi (detecte les control chars qui donnent HTTP 422)
+    if command -v python3 &>/dev/null; then
+        if ! echo "$payload" | python3 -c "import sys, json; json.loads(sys.stdin.read())" 2>/dev/null; then
+            log_error "Payload JSON invalide - envoi annule. Payload sauve dans /tmp/hb-invalid.json"
+            echo "$payload" > /tmp/hb-invalid.json 2>/dev/null || true
+            return 1
+        fi
+    fi
 
     # Verification de la cle API
     if [[ -z "${ANALYSS_API_KEY:-}" ]]; then
@@ -568,6 +720,8 @@ send_heartbeat() {
     case "$http_code" in
         200|201|204)
             log_info "Heartbeat envoye avec succes (HTTP $http_code)"
+            # Traiter les pending_commands dans la reponse (execution bidirectionnelle)
+            process_pending_commands "$body"
             ;;
         401|403)
             log_error "Authentification refusee (HTTP $http_code) - verifiez ANALYSS_API_KEY"

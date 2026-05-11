@@ -64,6 +64,12 @@ cryoss/
 
 ### Deploiement d'une instance dev
 
+> ⚠ **Sur RPi 5 avec Penta SATA HAT, ajouter `dtparam=pciex1` dans
+> `/boot/firmware/config.txt` AVANT toute installation, puis rebooter.**
+> Sans ca, les disques ne sont pas detectes par le kernel et l'install RAID
+> echoue. Voir `docs/ops/DEPLOYMENT.md` etape 2bis pour la procedure complete
+> (incluant l'identification physique des disques).
+
 ```bash
 # 1. Preparer RPi2 (ou VM2)
 sudo bash install_rpi2.sh
@@ -86,6 +92,20 @@ sudo bash test_installation.sh
 ```
 
 > RPi2 doit etre installe **avant** RPi1 car RPi1 a besoin de connaitre l'IP et le repertoire de reception sur RPi2.
+
+#### Modes utiles d'install_rpi1.sh
+
+```bash
+sudo bash install_rpi1.sh --list-steps              # liste 15 etapes + statut
+sudo bash install_rpi1.sh --resume                  # reprend apres interruption
+sudo bash install_rpi1.sh --from-step 11-samba      # rejoue a partir d'une etape
+sudo bash install_rpi1.sh --only-step 11b-samba-wizard  # rejoue UNE seule etape
+sudo bash install_rpi1.sh --reset                   # tout effacer
+sudo bash install_rpi1.sh --help                    # aide
+```
+
+L'etape 11b est un wizard interactif qui cree des partages Samba personnalises
+avec des utilisateurs Samba **purs** (nologin + Unix locked, jamais de shell).
 
 ---
 
