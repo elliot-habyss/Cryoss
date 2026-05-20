@@ -12,26 +12,57 @@
 
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+# =============================================================================
+#  CONFIGURATION RPi2 — consommée par la lib UI commune
+# =============================================================================
+CRYOSS_ROLE="rpi2"
+CRYOSS_STATE_DIR="/var/lib/cryoss"
+CRYOSS_INSTALL_LOG="/var/log/cryoss-install.log"
 
-ok()   { echo -e "${GREEN}[v]${NC} $1"; }
-info() { echo -e "${BLUE}[i]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err()  { echo -e "${RED}[x]${NC} $1"; exit 1; }
-step() { echo -e "\n${BOLD}${BLUE}--- $1 ---${NC}"; }
+# Liste ordonnée des étapes (ID:Titre) — utilisée pour --list-steps et la reprise
+CRYOSS_STEPS=(
+    "01-packages:Paquets de base"
+    "02-network:Interfaces LAN temp + interco (NetworkManager)"
+    "03-raid:RAID 1 md0 (mdadm sda+sdb)"
+    "04-mounts:Répertoires et montage"
+    "05-users:Utilisateurs (habyss + ds-repl SFTP-only)"
+    "06-ssh-sftp:SSH + chroot SFTP-only pour ds-repl"
+    "07-samba-disable:Désactivation Samba (RPi2 air-gapped)"
+    "08-hardening:Durcissement (UFW + fail2ban + sysctl)"
+    "09-monitoring:Monitoring cryoss-health (relais SMTP via RPi1)"
+)
 
+# Variables persistées dans /var/lib/cryoss/install.env (pour resume)
+CRYOSS_ENV_VARS=(
+    CLIENT_NAME
+    NET_IFACE NET_IP NET_CIDR NET_GW NET_DNS1 NET_DNS2
+    INTERCO_IFACE INTERCO_IP_RPI1 INTERCO_IP_RPI2 INTERCO_CIDR INTERCO_CON
+    RPI1_IP RPI2_DIR
+    DISK1 DISK2
+    HABYSS_PASS REPL_PASS
+    R2_EMAIL_TO
+)
+
+# Source de la lib UI commune
+LIB_UI="$(cd "$(dirname "$0")" && pwd)/lib/cryoss-installer-ui.sh"
+if [[ ! -f "$LIB_UI" ]]; then
+    echo "[✗] Lib UI manquante : $LIB_UI" >&2
+    echo "    Verifie que tu lances le script depuis le dossier du repo Cryoss." >&2
+    exit 1
+fi
+# shellcheck source=lib/cryoss-installer-ui.sh
+source "$LIB_UI"
+
+# CLI : parse + dispatch des modes
+cryoss_parse_cli "$@"
+cryoss_handle_readonly_modes
 [[ $EUID -ne 0 ]] && err "Executer en root : sudo bash $0"
+cryoss_handle_root_modes
 
 # =============================================================================
-#  COLLECTE
+#  COLLECTE — skippée si on reprend (env déjà chargé)
 # =============================================================================
-echo -e "${BOLD}"
-echo "============================================================"
-echo "  CRYOSS RPi2 - Installation (Secondaire)"
-echo "  Reception chiffree AES-256-CBC/KEY2 depuis RPi1 via SSH"
-echo "============================================================"
-echo -e "${NC}"
+if [[ "$CRYOSS_MODE" == "install" ]]; then
 
 step "Identification"
 read -rp "  Nom du client : " CLIENT_NAME
@@ -59,13 +90,9 @@ else
     NET_DNS1="1.1.1.1"; NET_DNS2="8.8.8.8"
 fi
 
-step "Réseau inter-RPi — interface câble direct vers RPi1"
-echo "  Le câble Ethernet direct RPi1(eth1-USB) ↔ RPi2 utilise un réseau dédié :"
-echo "    RPi1 : 10.42.0.1/30   RPi2 : 10.42.0.2/30  (identiques dans install_rpi1.sh)"
+step "Réseau inter-RPi — interface câble direct vers RPi1 (eth0 par convention Cryoss)"
+echo "  RPi1 : 10.42.0.1/30   RPi2 : 10.42.0.2/30"
 echo ""
-ip -o link show | awk -F': ' '{print "    " $2}' | grep -v lo
-echo
-read -rp "  Interface câble direct vers RPi1 (ex: eth0 ou eth1) : " INTERCO_IFACE
 
 # IPs inter-RPi fixes — identiques dans install_rpi1.sh
 INTERCO_IP_RPI1="10.42.0.1"
@@ -73,14 +100,28 @@ INTERCO_IP_RPI2="10.42.0.2"
 INTERCO_CIDR="30"
 INTERCO_CON="cryoss-interco"
 RPI1_IP="${INTERCO_IP_RPI1}"
+# Convention Cryoss : RPi2 a TOUJOURS eth0 pour l'interco (port Ethernet natif),
+# eth1+ etant reserve a la LAN temporaire d'install (USB ou WiFi sur certaines variantes).
+INTERCO_IFACE="eth0"
+if ! ip link show "$INTERCO_IFACE" &>/dev/null; then
+    err "Interface $INTERCO_IFACE absente. Verifie le cable interco RPi1↔RPi2 et les noms d'interface (ip link show)."
+fi
+ok "Interface interco : $INTERCO_IFACE (convention Cryoss)"
 
-read -rp "  Répertoire de réception ici (ex: /etc/encrypted/rpi1) : " RPI2_DIR
+# Convention Cryoss : RPi2 recoit sous /etc/encrypted/rpi1 (identique dans install_rpi1.sh).
+RPI2_DIR="/etc/encrypted/rpi1"
 
-step "RAID 1 (2 disques)"
-echo "  Disques :"; lsblk -d -o NAME,SIZE,MODEL 2>/dev/null | grep -v "^NAME\|mmcblk\|nvme" || true; echo
-read -rp "  Disque 1 (ex: sda) : " DISK1
-read -rp "  Disque 2 (ex: sdb) : " DISK2
-DISK1="/dev/${DISK1##/dev/}"; DISK2="/dev/${DISK2##/dev/}"
+step "RAID 1 (2 disques - sda + sdb par convention Cryoss)"
+echo "  Disques disponibles :"; lsblk -d -o NAME,SIZE,MODEL 2>/dev/null | grep -v "^NAME\|mmcblk\|nvme" || true; echo
+# Convention : RPi2 a toujours 2 disques SATA (sda+sdb), pas de Penta HAT.
+DISK1="/dev/sda"
+DISK2="/dev/sdb"
+for d in "$DISK1" "$DISK2"; do
+    if [[ ! -b "$d" ]]; then
+        err "Disque $d absent. Verifie le branchement SATA et lsblk."
+    fi
+done
+ok "Disques RAID : $DISK1 + $DISK2 (convention Cryoss)"
 
 step "Utilisateurs"
 HABYSS_PASS=$(openssl rand -base64 16)
@@ -103,19 +144,25 @@ echo
 read -rp "Confirmer ? [o/N] : " CONFIRM
 [[ "${CONFIRM,,}" != "o" ]] && err "Annule."
 
+# Sauvegarde de l'env collecte pour --resume / --from-step / --only-step
+cryoss_save_env
+ok "Variables sauvegardees : ${CRYOSS_ENV_FILE} (600 root)"
+
+fi  # fin du bloc collecte (CRYOSS_MODE == "install")
+
 # =============================================================================
 #  INSTALLATION
 # =============================================================================
 
-step "1. Paquets"
-# TOUS les paquets ici — avant UFW, tant que le LAN est accessible
-apt-get update -qq
-apt-get install -y openssl mdadm ufw fail2ban \
-    smartmontools msmtp msmtp-mta attr 2>/dev/null
-ok "Paquets installés"
+if cryoss_step "01-packages" "1. Paquets de base"; then
+    # TOUS les paquets ici — avant UFW, tant que le LAN est accessible
+    cryoss_run "apt-get update" -- apt-get update -qq
+    cryoss_apt_install openssl mdadm ufw fail2ban smartmontools msmtp msmtp-mta attr
+    cryoss_done "01-packages"
+fi
 
 # =============================================================================
-step "2. Interface LAN temporaire (apt uniquement)"
+if cryoss_step "02-network" "2. Interfaces LAN temp + interco (NetworkManager)"; then
 # Vérifier que l'interface LAN est active pour les téléchargements
 if ! ip addr show "$NET_IFACE" 2>/dev/null | grep -q "inet "; then
     if ! systemctl is-active --quiet NetworkManager 2>/dev/null; then
@@ -151,40 +198,51 @@ nmcli connection add type ethernet ifname "$INTERCO_IFACE" con-name "$INTERCO_CO
 nmcli connection up "$INTERCO_CON" 2>/dev/null || true
 ok "IP inter-RPi : ${INTERCO_IP_RPI2}/${INTERCO_CIDR} sur $INTERCO_IFACE (réseau de production)"
 info "RPi1 utilisera ${INTERCO_IP_RPI1} sur eth1 USB"
-step "3. RAID 1 (md0 - 2 disques)"
+    cryoss_done "02-network"
+fi
+
+# =============================================================================
+if cryoss_step "03-raid" "3. RAID 1 md0 (mdadm sda+sdb)"; then
 
 nuke_disk() {
     local disk=$1; info "Nettoyage $disk..."
-    for part in $(lsblk -ln -o NAME "$disk" | tail -n +2); do
-        umount -f "/dev/$part" 2>/dev/null || true
-    done
-    umount -f "$disk" 2>/dev/null || true
-    for md in $(grep "^md" /proc/mdstat 2>/dev/null | awk '{print $1}'); do
-        mdadm --detail "/dev/$md" 2>/dev/null | grep -q "$disk" && \
-            mdadm --stop "/dev/$md" 2>/dev/null || true
-    done
-    mdadm --zero-superblock --force "$disk" 2>/dev/null || true
-    wipefs -a -f "$disk" 2>/dev/null || true
-    dd if=/dev/zero of="$disk" bs=1M count=10 conv=fsync 2>/dev/null || true
-    parted -s "$disk" mklabel gpt 2>/dev/null || true
+    # Tout l'output (stdout+stderr) part dans le log d'install — UX propre.
+    {
+        for part in $(lsblk -ln -o NAME "$disk" 2>/dev/null | tail -n +2); do
+            umount -f "/dev/$part" || true
+        done
+        umount -f "$disk" || true
+        for md in $(grep "^md" /proc/mdstat 2>/dev/null | awk '{print $1}'); do
+            mdadm --detail "/dev/$md" 2>/dev/null | grep -q "$disk" && \
+                mdadm --stop "/dev/$md" || true
+        done
+        mdadm --zero-superblock --force "$disk" || true
+        wipefs -a -f "$disk" || true
+        dd if=/dev/zero of="$disk" bs=1M count=10 conv=fsync || true
+        parted -s "$disk" mklabel gpt || true
+    } &>> "$CRYOSS_INSTALL_LOG"
     ok "$disk nettoye"
 }
 
-[ -b /dev/md0 ] && { umount -f /dev/md0 2>/dev/null || true; mdadm --stop /dev/md0 2>/dev/null || true; }
+# Stop md existant — output redirige vers le log
+{
+    [ -b /dev/md0 ] && { umount -f /dev/md0 || true; mdadm --stop /dev/md0 || true; }
+} &>> "$CRYOSS_INSTALL_LOG"
 nuke_disk "$DISK1"; nuke_disk "$DISK2"
-sleep 2; partprobe "$DISK1" "$DISK2" 2>/dev/null || true; sleep 2
+sleep 2; partprobe "$DISK1" "$DISK2" &>> "$CRYOSS_INSTALL_LOG" || true; sleep 2
 
-info "Creation /dev/md0 ($DISK1 + $DISK2)..."
-mdadm --create /dev/md0 --level=1 --raid-devices=2 --bitmap=internal --run --force \
-    "$DISK1" "$DISK2" <<< "yes"
-ok "/dev/md0 cree"
+cryoss_run "Creation RAID md0 ($DISK1 + $DISK2)" -- bash -c \
+    "mdadm --create /dev/md0 --level=1 --raid-devices=2 --bitmap=internal --run --force '$DISK1' '$DISK2' <<< yes"
 
-sleep 10; cat /proc/mdstat
-mkfs.ext4 -F -q /dev/md0
-ok "md0 formate ext4"
+# Status RAID dans le log (pas en stdout pour garder l'UX propre)
+sleep 10
+cat /proc/mdstat &>> "$CRYOSS_INSTALL_LOG"
+cryoss_run "Formatage ext4 md0" -- mkfs.ext4 -F -q /dev/md0
+    cryoss_done "03-raid"
+fi
 
 # =============================================================================
-step "4. Repertoires et montage"
+if cryoss_step "04-mounts" "4. Répertoires et montage"; then
 
 mkdir -p /etc/encrypted
 mount /dev/md0 /etc/encrypted && ok "md0 -> /etc/encrypted" || warn "deja monte"
@@ -200,9 +258,11 @@ UUID_MD0=$(blkid -s UUID -o value /dev/md0)
 sed -i '/\/etc\/encrypted/d' /etc/fstab
 echo "UUID=$UUID_MD0   /etc/encrypted   ext4   defaults,nodev,nosuid   0   2" >> /etc/fstab
 ok "fstab mis a jour"
+    cryoss_done "04-mounts"
+fi
 
 # =============================================================================
-step "5. Utilisateurs et permissions"
+if cryoss_step "05-users" "5. Utilisateurs (habyss + ds-repl SFTP-only)"; then
 
 # Pas de ds-user ni samba-share : Samba non installé (RPi2 hors LAN)
 
@@ -243,30 +303,35 @@ chown root:root /etc/encrypted
 chmod 751 /etc/encrypted
 chown ds-repl:ds-repl "$RPI2_DIR"
 chmod 750 "$RPI2_DIR"
-ok "Permissions OK (encrypted:751, rpi1:750 ds-repl)"
+
+# Ajouter habyss au groupe ds-repl pour permettre le monitoring heartbeat
+# (le script cryoss-heartbeat.sh sur RPi1 fait SSH habyss@RPi2 pour lister
+#  les fichiers recus). Sans ca, habyss ne peut pas lire /etc/encrypted/rpi1.
+# Les fichiers eux-memes restent owned par ds-repl avec les permissions
+# definies par rclone (obfuscation des noms = protection additionnelle).
+usermod -aG ds-repl habyss 2>/dev/null && \
+    ok "habyss ajoute au groupe ds-repl (lecture reception pour monitoring)" || \
+    warn "Echec ajout habyss au groupe ds-repl - monitoring RPi2 peut voir 0 fichier"
+
+ok "Permissions OK (encrypted:751, rpi1:750 ds-repl, habyss in ds-repl)"
+    cryoss_done "05-users"
+fi
 
 # =============================================================================
-step "6. Acces SFTP-only pour ds-repl (rclone depuis RPi1)"
+if cryoss_step "06-ssh-sftp" "6. SSH + chroot SFTP-only pour ds-repl (rclone depuis RPi1)"; then
 
 # ds-repl est confine en SFTP-only via Match User dans sshd_config.
 # rclone sftp depuis RPi1 utilise le subsystem SFTP (pas de shell).
-# Plus besoin de cryoss-repl-check.sh — la securite est assuree par :
+# Securite assuree par :
 #   1. ForceCommand internal-sftp (aucune commande shell possible)
 #   2. ChrootDirectory $REPL_HOME (confine dans son home)
 #   3. Cle SSH-only (pas de mot de passe)
 #   4. AllowTcpForwarding no, X11 no, etc.
-
-warn "Collez la cle publique RPi1 (/root/.ssh/cryoss_rpi2.pub)"
-warn "ou laissez vide pour l'ajouter manuellement plus tard :"
-read -rp "  Cle publique RPi1 (ssh-ed25519 ...) : " RPI1_PUBKEY
-
-if [[ -n "$RPI1_PUBKEY" ]]; then
-    echo "$RPI1_PUBKEY" >> "${REPL_HOME}/.ssh/authorized_keys"
-    chown ds-repl:ds-repl "${REPL_HOME}/.ssh/authorized_keys"
-    ok "Cle RPi1 ajoutee pour ds-repl (SFTP-only)"
-else
-    warn "A faire manuellement : echo 'ssh-ed25519 AAAA...' >> ${REPL_HOME}/.ssh/authorized_keys"
-fi
+#
+# La cle publique de RPi1 est poussee automatiquement par install_rpi1.sh
+# step 07-ssh-rpi2 (via habyss+sudo). Plus besoin de prompt manuel ici.
+info "Cle publique RPi1 → ds-repl : sera deposee automatiquement par install_rpi1.sh step 07"
+info "(SFTP-only, chroot, password Unix verrouille = securite multi-couches)"
 
 # Le chroot SFTP requiert que $REPL_HOME soit propriete de root
 # et que le sous-dossier data/ soit proprietaire ds-repl
@@ -290,12 +355,11 @@ if ! grep -q "ds-repl/data" /etc/fstab 2>/dev/null; then
 fi
 
 ok "SFTP chroot configure pour ds-repl"
+    cryoss_done "06-ssh-sftp"
+fi
 
 # =============================================================================
-step "7. Samba"
-
-# =============================================================================
-step "8. Désactivation Samba (RPi2 air-gapped)"
+if cryoss_step "07-samba-disable" "7. Désactivation Samba (RPi2 air-gapped)"; then
 
 # Samba n'est pas utilisé sur RPi2 : pas de LAN client accessible
 # Si smbd est présent (dépendance OS), on le désactive complètement
@@ -303,9 +367,11 @@ systemctl disable --now smbd nmbd winbind 2>/dev/null || true
 systemctl mask smbd nmbd 2>/dev/null || true
 ok "Samba désactivé et masqué (RPi2 n'est pas accessible depuis le LAN)"
 info "Les archives chiffrees (rclone crypt) sont accessibles depuis RPi1 via : ssh cryoss-rpi2 'ls /etc/encrypted/'"
+    cryoss_done "07-samba-disable"
+fi
 
 # =============================================================================
-step "8. Durcissement systeme"
+if cryoss_step "08-hardening" "8. Durcissement systeme (SSH + UFW + fail2ban + sysctl)"; then
 
 # SSH — habyss pour admin, ds-repl confine en SFTP-only
 cat > /etc/ssh/sshd_config.d/99-cryoss.conf <<SSH_EOF
@@ -375,6 +441,11 @@ ok "Regle UFW LAN sera auto-supprimee dans 2h (cryoss-ufw-cleanup.timer)"
 
 # Fail2Ban
 cat > /etc/fail2ban/jail.d/99-cryoss.conf <<F2B_EOF
+[DEFAULT]
+# Ne jamais bannir le RPi1 (lien interco Cryoss) - sinon la reception des
+# replications casse et il faut console physique pour reparer
+ignoreip = 127.0.0.1/8 ::1 ${INTERCO_IP_RPI1}/32
+
 [sshd]
 enabled=true
 port=ssh
@@ -383,7 +454,7 @@ bantime=3600
 findtime=600
 F2B_EOF
 systemctl enable fail2ban; systemctl restart fail2ban
-ok "Fail2Ban configure"
+ok "Fail2Ban configure (RPi1 ${INTERCO_IP_RPI1} whitelisted)"
 
 for SVC in bluetooth avahi-daemon cups triggerhappy; do
     systemctl disable --now "$SVC" 2>/dev/null && warn "$SVC desactive" || true
@@ -415,9 +486,11 @@ cat > /etc/logrotate.d/cryoss-rpi2 <<LR_EOF
 # Pas de log Samba (désactivé sur RPi2)
 LR_EOF
 ok "Logrotate configure"
+    cryoss_done "08-hardening"
+fi
 
 # =============================================================================
-step "9. Monitoring et sante (cryoss-health)"
+if cryoss_step "09-monitoring" "9. Monitoring cryoss-health (relais SMTP via RPi1)"; then
 
 # smartmontools + msmtp déjà installés en step 1
 
@@ -425,7 +498,13 @@ step "9. Monitoring et sante (cryoss-health)"
 # RPi1 expose un relais msmtp sur 10.42.0.1:25 (configuré dans install_rpi1.sh)
 info "RPi2 est hors LAN — les emails de monitoring transitent via RPi1 (10.42.0.1)"
 info "RPi1 agit comme relais SMTP local sur le lien interco."
-read -rp "  Email destinataire pour les alertes RPi2 : " R2_EMAIL_TO
+# Skip prompt si CRYOSS_R2_EMAIL_TO defini en env (futur handoff depuis RPi1).
+if [[ -n "${CRYOSS_R2_EMAIL_TO:-}" ]]; then
+    R2_EMAIL_TO="$CRYOSS_R2_EMAIL_TO"
+    ok "Email destinataire (depuis env CRYOSS_R2_EMAIL_TO) : $R2_EMAIL_TO"
+else
+    read -rp "  Email destinataire pour les alertes RPi2 : " R2_EMAIL_TO
+fi
 R2_SMTP_HOST="${INTERCO_IP_RPI1}"
 R2_SMTP_PORT="25"
 
@@ -446,32 +525,221 @@ chmod 600 /etc/msmtprc; chown root:root /etc/msmtprc
 ok "msmtp configuré — relais via RPi1 (${INTERCO_IP_RPI1}:25)"
 warn "RPi1 doit avoir le relais SMTP activé (install_rpi1.sh configure postfix/msmtp-relay)"
 
+# Librairie email HTML partagee (meme contenu que sur RPi1)
+mkdir -p /usr/local/lib
+cat > /usr/local/lib/cryoss-email.sh << 'EMAILLIB_EOF'
+#!/usr/bin/env bash
+# CRYOSS - Librairie templates email HTML (partagee RPi1/RPi2)
+
+: "${CLIENT_NAME:=CRYOSS}"
+: "${EMAIL_TO:=}"
+: "${EMAIL_TO_2:=}"
+: "${HOSTNAME_VAL:=$(hostname 2>/dev/null || echo unknown)}"
+: "${LOG:=/var/log/cryoss-email.log}"
+
+_tshort() { date '+%d/%m/%Y %H:%M'; }
+
+_elog() {
+    [[ -n "${LOG:-}" ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] [email] $1" >> "$LOG" 2>/dev/null || true
+}
+
+badge() {
+    local lbl="$1" t="$2"
+    case "$t" in
+        ok)   echo "<span style='background:#ecfdf5;color:#059669;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #a7f3d0;'>$lbl</span>" ;;
+        warn) echo "<span style='background:#fffbeb;color:#d97706;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #fde68a;'>$lbl</span>" ;;
+        crit) echo "<span style='background:#fef2f2;color:#dc2626;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #fecaca;'>$lbl</span>" ;;
+        info) echo "<span style='background:#eef2ff;color:#6366f1;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #c7d2fe;'>$lbl</span>" ;;
+        *)    echo "<span style='background:#f1f5f9;color:#475569;padding:2px 9px;border-radius:3px;font-size:11px;font-weight:700;border:1px solid #cbd5e1;'>$lbl</span>" ;;
+    esac
+}
+
+section_open() {
+    echo "<table width='100%' cellpadding='0' cellspacing='0' style='margin-bottom:18px;'><tr><td style='padding-bottom:7px;border-bottom:1px solid #e2e8f0;'><span style='color:#2563eb;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;'>$1</span></td></tr><tr><td style='padding-top:10px;'><table width='100%' cellpadding='0' cellspacing='0'>"
+}
+section_close() { echo "</table></td></tr></table>"; }
+
+mrow() {
+    echo "<tr><td style='padding:5px 0;color:#64748b;font-size:13px;width:48%;'>$1</td><td style='padding:5px 0;color:#1e293b;font-size:13px;font-weight:600;'>$2 $3</td></tr>"
+}
+
+alert_banner() {
+    local msg="$1" type="${2:-crit}"
+    case "$type" in
+        ok)   echo "<div style='background:#f0fdf4;border-left:4px solid #059669;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#059669;font-weight:700;font-size:14px;'>&#10003; $msg</span></div>" ;;
+        warn) echo "<div style='background:#fffbeb;border-left:4px solid #d97706;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#d97706;font-weight:700;font-size:14px;'>&#9888; $msg</span></div>" ;;
+        info) echo "<div style='background:#eff6ff;border-left:4px solid #2563eb;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#2563eb;font-weight:700;font-size:14px;'>&#8505; $msg</span></div>" ;;
+        crit|*) echo "<div style='background:#fef2f2;border-left:4px solid #dc2626;padding:11px 14px;border-radius:0 6px 6px 0;margin-bottom:18px;'><span style='color:#dc2626;font-weight:700;font-size:14px;'>&#9888; $msg</span></div>" ;;
+    esac
+}
+
+code_block() {
+    echo "<pre style='font-family:monospace;font-size:11px;color:#1e293b;background:#f1f5f9;padding:10px;border-radius:5px;overflow-x:auto;margin:6px 0;white-space:pre-wrap;word-break:break-all;border:1px solid #e2e8f0;'>$1</pre>"
+}
+
+wrap_email() {
+    local title="$1" body="$2" accent="${3:-info}"
+    local accent_color
+    case "$accent" in
+        ok)   accent_color="#059669" ;;
+        warn) accent_color="#d97706" ;;
+        crit) accent_color="#dc2626" ;;
+        *)    accent_color="#2563eb" ;;
+    esac
+    cat << TMPL
+<!DOCTYPE html>
+<html lang="fr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f8f9fa;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f8f9fa;">
+<tr><td align="center" style="padding:28px 12px;">
+<table width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;background:#ffffff;border-radius:8px;border:1px solid #e2e8f0;overflow:hidden;">
+  <tr><td style="background:#ffffff;padding:24px 36px;border-bottom:2px solid ${accent_color};">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td><span style="font-size:20px;font-weight:800;color:#1e293b;letter-spacing:1px;">CRYOSS</span>
+      <p style="margin:4px 0 0;color:#64748b;font-size:11px;letter-spacing:2px;text-transform:uppercase;">Monitoring</p></td>
+      <td align="right" valign="middle"><span style="background:#eff6ff;border:1px solid ${accent_color};color:${accent_color};padding:5px 13px;border-radius:16px;font-size:12px;font-weight:700;letter-spacing:1px;">${CLIENT_NAME}</span></td>
+    </tr></table>
+  </td></tr>
+  <tr><td style="padding:24px 36px 6px;">
+    <h1 style="margin:0;color:#1e293b;font-size:18px;font-weight:700;">${title}</h1>
+    <p style="margin:5px 0 0;color:#64748b;font-size:12px;">$(_tshort) &nbsp;&bull;&nbsp; ${HOSTNAME_VAL}</p>
+  </td></tr>
+  <tr><td style="padding:14px 36px 28px;">${body}</td></tr>
+  <tr><td style="background:#f8f9fa;padding:16px 36px;border-top:1px solid #e2e8f0;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td style="color:#94a3b8;font-size:11px;">Cryoss &copy; <a href="https://analyss.fr" style="color:#2563eb;text-decoration:none;">Analyss</a> &mdash; Rapport automatique</td>
+      <td align="right"><a href="https://analyss.fr" style="color:#2563eb;font-size:11px;text-decoration:none;">analyss.fr</a></td>
+    </tr></table>
+  </td></tr>
+</table></td></tr></table>
+</body></html>
+TMPL
+}
+
+send_html_email() {
+    local subject="$1" full_html="$2"
+    local rc=0
+    for DEST in "$EMAIL_TO" "$EMAIL_TO_2"; do
+        [[ -z "$DEST" ]] && continue
+        {
+            echo "To: $DEST"
+            echo "Subject: $subject"
+            echo "MIME-Version: 1.0"
+            echo "Content-Type: text/html; charset=UTF-8"
+            echo ""
+            echo "$full_html"
+        } | msmtp "$DEST" 2>/dev/null || { _elog "WARN: email vers $DEST echoue"; rc=1; }
+    done
+    return $rc
+}
+
+send_email_wrapped() {
+    local subject="$1" title="$2" body="$3" accent="${4:-info}"
+    local full_html
+    full_html=$(wrap_email "$title" "$body" "$accent")
+    send_html_email "$subject" "$full_html"
+}
+EMAILLIB_EOF
+chmod 644 /usr/local/lib/cryoss-email.sh
+chown root:root /usr/local/lib/cryoss-email.sh
+ok "Librairie email HTML installee : /usr/local/lib/cryoss-email.sh"
+
 cat > /usr/local/bin/cryoss-health.sh << 'HEALTH_EOF'
 #!/bin/bash
 # CRYOSS - Monitoring sante RPi2
 set -euo pipefail
 
 EMAIL_TO="DS_EMAIL_TO"
+EMAIL_TO_2=""
 CLIENT_NAME="DS_CLIENT_NAME"
 RPI1_IP="DS_RPI1_IP"
 RPI2_DIR="DS_RPI2_DIR"
 LOG="/var/log/cryoss-health.log"
 MODE="${1:-daily}"
 HOSTNAME_SHORT=$(hostname -s)
+HOSTNAME_VAL="$HOSTNAME_SHORT"
 DATE_LABEL=$(date '+%d/%m/%Y %H:%M')
 ANOMALIES=()
 REPORT=""
+# Collecte HTML structure (sections/mrows) pour email HTML
+HTML_SECTIONS=""
+_current_section=""
+_current_rows=""
+
+# Sourcer la librairie email HTML partagee si presente
+if [[ -f /usr/local/lib/cryoss-email.sh ]]; then
+    # shellcheck source=/usr/local/lib/cryoss-email.sh
+    source /usr/local/lib/cryoss-email.sh
+fi
 
 log()       { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
-section()   { REPORT="${REPORT}\n$(printf '=%.0s' {1..50})\n  $1\n$(printf '=%.0s' {1..50})\n"; }
+
+# Section text + HTML
+section() {
+    REPORT="${REPORT}\n$(printf '=%.0s' {1..50})\n  $1\n$(printf '=%.0s' {1..50})\n"
+    # Cloturer la section HTML precedente s'il y en a une
+    if [[ -n "$_current_section" ]]; then
+        if declare -F section_open &>/dev/null; then
+            HTML_SECTIONS+="$(section_open "$_current_section")$_current_rows$(section_close)"
+        fi
+    fi
+    _current_section="$1"
+    _current_rows=""
+}
+
+# Ajout d'une ligne text + HTML mrow
+_add_row() {
+    local status="$1" content="$2"
+    local html_badge=""
+    case "$status" in
+        ok)   html_badge=$(declare -F badge &>/dev/null && badge "OK" ok) ;;
+        warn) html_badge=$(declare -F badge &>/dev/null && badge "ATTENTION" warn) ;;
+        info) html_badge="" ;;
+    esac
+    if declare -F mrow &>/dev/null; then
+        _current_rows+="$(mrow "$content" "" "$html_badge")"
+    fi
+}
+
 line()      { REPORT="${REPORT}$1\n"; }
 alert()     { ANOMALIES+=("$1"); log "ANOMALIE: $1"; }
-ok_line()   { line "  [OK]  $1"; }
-warn_line() { line "  [!!]  $1"; alert "$1"; }
-info_line() { line "  [--]  $1"; }
+ok_line()   { line "  [OK]  $1"; _add_row ok "$1"; }
+warn_line() { line "  [!!]  $1"; alert "$1"; _add_row warn "$1"; }
+info_line() { line "  [--]  $1"; _add_row info "$1"; }
+
+# Finaliser la derniere section avant envoi
+_close_html_sections() {
+    if [[ -n "$_current_section" ]] && declare -F section_open &>/dev/null; then
+        HTML_SECTIONS+="$(section_open "$_current_section")$_current_rows$(section_close)"
+        _current_section=""
+        _current_rows=""
+    fi
+}
 
 send_mail() {
     local subject="$1" body="$2"
+    # Envoi HTML si la lib est disponible
+    if declare -F send_email_wrapped &>/dev/null && [[ -n "$HTML_SECTIONS" ]]; then
+        _close_html_sections
+        local accent="ok"
+        [[ ${#ANOMALIES[@]} -gt 0 ]] && accent="warn"
+        local banner
+        if [[ ${#ANOMALIES[@]} -eq 0 ]]; then
+            banner=$(alert_banner "Monitoring RPi2 — tout est sain" "ok")
+        else
+            banner=$(alert_banner "Monitoring RPi2 — ${#ANOMALIES[@]} anomalie(s) detectee(s)" "warn")
+        fi
+        local html_body="${banner}${HTML_SECTIONS}"
+        local title_mode
+        case "$MODE" in
+            daily)  title_mode="Rapport quotidien" ;;
+            weekly) title_mode="Rapport hebdomadaire" ;;
+            *)      title_mode="Rapport $MODE" ;;
+        esac
+        send_email_wrapped "$subject" "RPi2 — $title_mode" "$html_body" "$accent" && return 0
+    fi
+    # Fallback plain text
     { echo "To: $EMAIL_TO"; echo "Subject: $subject"; echo ""; echo -e "$body"; } \
         | msmtp "$EMAIL_TO" 2>/dev/null || log "WARN: email non envoye"
 }
@@ -638,10 +906,34 @@ build_report() {
 
 send_alerts() {
     [[ ${#ANOMALIES[@]} -eq 0 ]] && return
+    local subject="[ALERTE RPi2 $CLIENT_NAME] ${#ANOMALIES[@]} anomalie(s) - $DATE_LABEL"
+
+    # Version HTML si la lib est chargee
+    if declare -F send_email_wrapped &>/dev/null; then
+        local banner html_body
+        banner=$(alert_banner "${#ANOMALIES[@]} anomalie(s) detectee(s) sur le RPi2 de replication" "crit")
+        html_body="$banner"
+        html_body+=$(section_open "ANOMALIES DETECTEES")
+        for A in "${ANOMALIES[@]}"; do
+            html_body+=$(mrow "$A" "" "$(badge "A TRAITER" warn)")
+        done
+        html_body+=$(section_close)
+        html_body+=$(section_open "CONTEXTE")
+        html_body+=$(mrow "Hote" "$HOSTNAME_SHORT" "")
+        html_body+=$(mrow "Mode" "$MODE" "")
+        html_body+=$(mrow "Liaison RPi1" "$RPI1_IP" "")
+        html_body+=$(mrow "Repertoire reception" "$RPI2_DIR" "")
+        html_body+=$(section_close)
+        send_email_wrapped "$subject" "Alerte RPi2 — ${#ANOMALIES[@]} anomalie(s)" "$html_body" "crit" \
+            && { log "Alerte envoyee (HTML)"; return 0; }
+    fi
+
+    # Fallback plain text
     local body="ALERTE CRYOSS RPi2 [$CLIENT_NAME] - $DATE_LABEL\n\n${#ANOMALIES[@]} anomalie(s) :\n\n"
     for A in "${ANOMALIES[@]}"; do body="${body}  >> $A\n"; done
-    send_mail "[ALERTE RPi2 $CLIENT_NAME] ${#ANOMALIES[@]} anomalie(s) - $DATE_LABEL" "$body"
-    log "Alerte envoyee"
+    { echo "To: $EMAIL_TO"; echo "Subject: $subject"; echo ""; echo -e "$body"; } \
+        | msmtp "$EMAIL_TO" 2>/dev/null || log "WARN: alerte non envoyee"
+    log "Alerte envoyee (plain)"
 }
 
 log "=== Monitoring RPi2 [$MODE] ==="
@@ -717,6 +1009,8 @@ ok "Timers monitoring RPi2 : quotidien 06h30 | hebdomadaire lundi 07h30"
 info "Test rapport sante RPi2..."
 /usr/local/bin/cryoss-health.sh daily && ok "Rapport test envoye a ${R2_EMAIL_TO}" \
     || warn "Erreur rapport test — verifiez msmtp"
+    cryoss_done "09-monitoring"
+fi
 
 # =============================================================================
 #  RESUME

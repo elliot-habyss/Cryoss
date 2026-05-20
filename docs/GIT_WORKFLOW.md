@@ -93,7 +93,7 @@ script intermediaire avec validation des arguments.
 
 3. **Tester sur un RPi dev** (ou VM) :
    - Deployer avec `update.sh` ou manuellement.
-   - Lancer `test_installation.sh` — tous les tests doivent passer.
+   - Lancer `tests/cryoss-test.sh` — tous les tests doivent passer.
    - Verifier les logs (`journalctl`, `/var/log/cryoss-*.log`).
 
 4. **Ouvrir une PR** vers `dev` :
@@ -125,7 +125,7 @@ script intermediaire avec validation des arguments.
    cd /chemin/vers/cryoss
    git pull origin main
    sudo bash update.sh
-   sudo bash test_installation.sh
+   sudo bash tests/cryoss-test.sh
    ```
 
 ### Versionnage
