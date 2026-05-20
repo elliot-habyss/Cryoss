@@ -61,126 +61,6 @@ PC Client (Windows)
 
 ---
 
-## ⚠ Pre-installation — Activation PCIe pour le Penta SATA HAT (RPi 5)
-
-**A FAIRE AVANT TOUTE INSTALLATION** sur RPi1 ET RPi2 si vous utilisez un
-Penta SATA HAT (ou tout HAT PCIe). Sans ca, **les disques ne seront pas
-detectes** par le kernel — `lsblk` ne montrera que la carte SD et l'install
-echouera des l'etape RAID.
-
-### 1. Editer la config bootloader
-
-```bash
-sudo nano /boot/firmware/config.txt
-```
-
-Ajouter ces lignes en bas du fichier (apres la section `[all]` ou en creer une) :
-
-```ini
-# Cryoss — activer le PCIe pour le Penta SATA HAT (Radxa / Geekworm / autres)
-dtparam=pciex1
-# Optionnel : forcer Gen 3 (5 GT/s) au lieu de Gen 2 par defaut. Augmente le debit
-# mais peut etre instable sur certains HATs ou cables. Activer SEULEMENT apres
-# avoir valide que `dtparam=pciex1` seul fonctionne.
-# dtparam=pciex1_gen=3
-```
-
-### 2. Redemarrer
-
-```bash
-sudo reboot
-```
-
-### 3. Verifier la detection PCIe puis les disques
-
-```bash
-# Le bus PCIe doit apparaitre
-lspci
-# → 0000:01:00.0 SATA controller: ASMedia ASM1166 ...   (ou similaire selon le HAT)
-
-# Les 4 disques doivent etre listes (sda, sdb, sdc, sdd)
-lsblk -d -o NAME,SIZE,MODEL,SERIAL,TRAN
-# → sda  X.XT  WDC...  WD-XXXX  sata
-# → sdb  X.XT  WDC...  WD-XXXX  sata
-# → sdc  X.XT  WDC...  WD-XXXX  sata
-# → sdd  X.XT  WDC...  WD-XXXX  sata
-
-# Si rien : verifier que le HAT est bien clipse, le cable PCIe FFC dans le bon
-# sens, et que `dtparam=pciex1` est bien present sans typo dans config.txt.
-```
-
-> **Astuce typo** : la ligne s'ecrit bien `dtparam=pciex1` (un X minuscule, un 1).
-> `dtparam=pciex` ou `dtparam=pcie_x1` ne fonctionneront pas.
-
-> **Distros plus anciennes** : sur Bullseye et anterieurs le fichier est
-> `/boot/config.txt`. Sur Bookworm et plus recent (recommande pour Cryoss),
-> c'est `/boot/firmware/config.txt`.
-
-### 4. Identifier physiquement chaque disque AVANT d'installer
-
-Avant de lancer `install_rpi1.sh` (qui formate et detruit les donnees existantes),
-il est **fortement recommande** de noter quel `/dev/sdX` correspond a quelle baie
-physique du HAT. Ca facilite enormement le depannage en cas de panne disque
-(remplacement a chaud, identification du disque defectueux a la LED).
-
-```bash
-# 1) Recuperer le numero de serie de chaque disque kernel-detecte
-for d in /dev/sd?; do
-    echo "=== $d ==="
-    sudo smartctl -i "$d" | grep -E "Serial Number|Model|User Capacity"
-done
-
-# 2) Faire clignoter chaque disque tour a tour pour reperer la baie
-sudo dd if=/dev/sda of=/dev/null bs=1M count=2000 status=progress
-# → la LED de la baie correspondante clignote pendant ~10s
-# → noter "Baie 1 = sda = serial WD-XXXXX"
-# Repeter pour sdb, sdc, sdd.
-
-# 3) Coller une etiquette physique sur chaque disque avec :
-#    - sa baie HAT (1, 2, 3, 4)
-#    - les 6 derniers chiffres du serial
-#    - son role Cryoss (md0=sauvegarde / md1=encrypted)
-```
-
-**Layout par defaut Cryoss** :
-
-| Baie HAT | /dev/* | RAID | Role |
-|----------|--------|------|------|
-| S1 (haut-gauche)  | sda | md0 | /etc/sauvegarde (donnees client) |
-| S2 (haut-droit)   | sdb | md0 | /etc/sauvegarde (miroir) |
-| S3 (bas-gauche)   | sdc | md1 | /etc/encrypted (chiffre rclone) |
-| S4 (bas-droit)    | sdd | md1 | /etc/encrypted (miroir) |
-
-> Ce layout correspond a la convention du Penta SATA HAT Radxa. Sur d'autres
-> modeles, les correspondances baie ↔ port SATA peuvent varier — utiliser la
-> methode `dd` ci-dessus pour confirmer.
-
-### 5. (Optionnel mais recommande) Fixer l'ordre via udev
-
-Les noms `sda`/`sdb`/... peuvent permuter d'un boot a l'autre. Cryoss utilise
-les UUID donc ca ne casse pas le RAID, mais pour le depannage c'est confortable
-d'avoir des liens stables :
-
-```bash
-sudo nano /etc/udev/rules.d/99-cryoss-disks.rules
-```
-
-```
-# Remplacer les serials par ceux releves a l'etape precedente
-SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXX1", SYMLINK+="cryoss/baie1"
-SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXX2", SYMLINK+="cryoss/baie2"
-SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXX3", SYMLINK+="cryoss/baie3"
-SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXX4", SYMLINK+="cryoss/baie4"
-```
-
-```bash
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-ls -l /dev/cryoss/   # → baie1 → ../sda, baie2 → ../sdb, ...
-```
-
----
-
 ## Ordre d'installation
 
 ```
@@ -216,99 +96,8 @@ Mot de passe ds-repl: ______________
 
 ## ETAPE 2 — Installer RPi1
 
-> ⚠ **Pre-requis** : avoir applique la section "Pre-installation — Activation
-> PCIe" ci-dessus (`dtparam=pciex1` dans `/boot/firmware/config.txt`). Sans ca,
-> l'install echouera a l'etape RAID car aucun disque ne sera detecte.
-
-### Mode standard
-
 ```bash
 sudo bash install_rpi1.sh
-```
-
-### Modes avances (resume / rejeu d'etapes)
-
-L'installeur est divise en 15 etapes numerotees, chacune avec un checkpoint
-persistant. Si l'install est interrompue (ssh coupe, panne secteur, erreur),
-la reprise se fait sans tout recommencer.
-
-```bash
-# Lister les etapes et leur statut (✓ fait / ○ a faire)
-sudo bash install_rpi1.sh --list-steps
-
-# Reprendre apres une interruption (skip les etapes deja validees)
-sudo bash install_rpi1.sh --resume
-
-# Repartir depuis une etape precise (rejoue celle-la + toutes les suivantes)
-sudo bash install_rpi1.sh --from-step 11-samba
-
-# Rejouer UNIQUEMENT une etape, sans toucher au reste
-# (cas d'usage typique : ajouter de nouveaux partages plus tard)
-sudo bash install_rpi1.sh --only-step 11b-samba-wizard
-
-# Tout reinitialiser (efface l'etat ET les variables sauvegardees)
-sudo bash install_rpi1.sh --reset
-
-# Afficher l'aide
-sudo bash install_rpi1.sh --help
-```
-
-**Fichiers d'etat (mode 600 root) :**
-
-| Fichier | Role |
-|---------|------|
-| `/var/lib/cryoss/install.state` | Liste des etapes validees (1 ID/ligne) |
-| `/var/lib/cryoss/install.env` | Variables collectees (incl. mots de passe SMTP/SFTP en clair) |
-| `/var/log/cryoss-install.log` | Log brut de toutes les commandes encapsulees |
-
-> **Securite** : `install.env` contient les mots de passe SMTP et SFTP en clair
-> (mode 600 root, repo prive). Si vous deployez sur un poste partage, supprimez
-> ce fichier apres install reussie : `sudo rm /var/lib/cryoss/install.env`.
-
-### Liste des etapes
-
-```
-01-packages          Paquets de base
-02-network           IP fixe (NetworkManager)
-03-raid              RAID 1 (mdadm)
-04-mounts            Repertoires et montage
-05-users             Utilisateurs systeme et permissions
-06-rclone            Configuration rclone (3 chemins chiffres)
-07-ssh-rpi2          Cle SSH pour replication RPi2
-09-msmtp             msmtp + relais SMTP
-09b-emaillib         Librairie email HTML
-10-backup-script     Script cryoss-backup.sh
-11-samba             Samba (partages de base)
-11b-samba-wizard     Partages personnalises (interactif)
-12-systemd           Services et timers systemd
-13-hardening         Durcissement systeme
-14-monitoring        Monitoring et rapports HTML
-```
-
-### Etape 11b — Wizard de partages Samba personnalises
-
-Apres la config Samba de base (partages `[sauvegarde]` et `[encrypted_backup]`),
-le script propose un wizard interactif pour creer des partages supplementaires
-avec leurs propres utilisateurs et niveaux de droits.
-
-**Caracteristiques :**
-
-- **Utilisateurs Samba purs** — jamais de comptes systeme exploitables :
-  `useradd -r -M -s /usr/sbin/nologin -d /nonexistent` + `passwd -l` (mot de
-  passe Unix verrouille). Aucun acces SSH, aucun login console possible. Seul
-  `smbpasswd` les active pour l'authentification Samba.
-- **Matrice de droits** — pour chaque (partage × utilisateur), choisir
-  `R` (lecture seule), `RW` (lecture + ecriture) ou `–` (refus explicite).
-- **Persistance** — la config est sauvegardee dans `/etc/cryoss/shares.conf`,
-  rejouable et editable. Les blocs Samba generes vont dans
-  `/etc/samba/cryoss-shares.conf` (inclus depuis `smb.conf`).
-- **Validation** — noms reserves bloques (`habyss`, `root`, `ds-user`,
-  `sauvegarde`, `encrypted_backup`, `global`), pattern `[a-z][a-z0-9_-]{1,31}`.
-
-**Pour ajouter / modifier des partages plus tard** :
-
-```bash
-sudo bash install_rpi1.sh --only-step 11b-samba-wizard
 ```
 
 > ⚠ **Les 3 paires de cles de chiffrement sont auto-generees** et sauvegardees
@@ -377,70 +166,6 @@ sudo bash install_security.sh
 sudo bash install_api.sh                  # API seule
 sudo bash install_api.sh --with-tunnel    # API + tunnel SSH inverse
 ```
-
-`install_api.sh` deploie aussi :
-- `cryoss-command-runner.sh` (executeur des commandes Console Analyss)
-- `cryoss-decrypt-secret` (helper Fernet pour les params chiffres)
-- Service+timer `cryoss-decrypted-cleanup` (nettoyage TTL 1h des dechiffres
-  a la demande)
-
----
-
-## ETAPE 5b — Master key Console Analyss (Fernet)
-
-> Optionnelle — uniquement si vous utilisez les commandes bidirectionnelles
-> Console (panels users / shares / decrypt_path). Si vous restez en monitoring
-> read-only, sautez cette etape.
-
-La Console Analyss envoie certains parametres (mots de passe Samba ajoutes
-via le panel "Utilisateurs") chiffres en Fernet (`enc:v1:<token>`). Le runner
-local doit pouvoir les dechiffrer avec une cle partagee.
-
-```bash
-sudo bash install_rpi1.sh --only-step 15-master-key
-```
-
-L'etape :
-1. Verifie / installe `python3-cryptography`.
-2. Demande la master key (copie depuis l'UI Analyss, format Fernet base64
-   url-safe, 44 caracteres).
-3. Valide via un `encrypt+decrypt` de test.
-4. Pose dans `/etc/cryoss/master_key` (mode 0600 root:root).
-
-> ⚠ Sans master key, toute commande contenant un parametre `enc:v1:` sera
-> ack_error avec "missing Cryoss master key". Les commandes en clair-text
-> (diagnostics, restart_service, etc.) fonctionnent normalement.
-
-**Rotation** : procedure documentee dans ADR 0001 §4 cote Analyss (drain de la
-queue → generer → push → cutover Console → verifier). Pas de dual-key grace
-period en v1.
-
----
-
-## ETAPE 5c — Roots filesystem (override optionnel)
-
-Le runner utilise par defaut :
-
-| Variable                | Default              | Role                              |
-|-------------------------|----------------------|-----------------------------------|
-| `CRYOSS_SHARE_ROOT`     | `/etc/sauvegarde`    | Racine des partages Samba         |
-| `CRYOSS_ARCHIVE_ROOT`   | `/etc/encrypted`     | Cible de `decrypt_path`           |
-| `CRYOSS_DECRYPT_DIR`    | `/var/lib/cryoss/decrypted` | Dest. dechiffrement a la demande |
-| `CRYOSS_DECRYPT_TTL_HOURS` | `1`               | TTL avant cleanup auto            |
-
-Si votre layout differe (RAID montes ailleurs), creez `/etc/cryoss/config.env`
-en mode 600 root:root :
-
-```bash
-sudo install -m 600 -o root -g root /dev/null /etc/cryoss/config.env
-sudo tee /etc/cryoss/config.env <<'EOF'
-CRYOSS_SHARE_ROOT=/data/sauvegarde
-CRYOSS_ARCHIVE_ROOT=/data/encrypted
-EOF
-```
-
-Le parser est strict (whitelist limitee, pas de `source`) — toute variable
-non-whitelistee genere un WARN et est ignoree.
 
 ---
 
@@ -529,47 +254,52 @@ rclone sync cryoss-c3-versions:2025-06-14 /tmp/restore   # restaurer une date
 
 ### Identifier physiquement les disques (Penta SATA HAT)
 
-Voir la section "Pre-installation — Activation PCIe" plus haut pour la procedure
-complete (commandes `dd` pour faire clignoter, `smartctl -i` pour les serials,
-udev pour des liens stables `/dev/cryoss/baieN`).
+Les noms `sda`, `sdb`, `sdc`, `sdd` sont attribues par le kernel et
+**peuvent changer apres un reboot**. Cryoss utilise les UUID, donc ca
+ne casse rien — mais il faut identifier les disques a l'installation.
 
-**Schema Penta SATA HAT (vue de dessus, layout Cryoss) :**
+```bash
+# Voir tous les disques avec serial et taille
+lsblk -o NAME,SIZE,MODEL,SERIAL,TRAN
+
+# Methode 1 : faire clignoter un disque
+dd if=/dev/sda of=/dev/null bs=1M count=100 &
+# → observer quelle LED clignote
+
+# Methode 2 : numero de serie
+smartctl -i /dev/sda | grep "Serial Number"
+# → comparer avec le numero sur le disque physique
+
+# Methode 3 : debrancher un disque et voir lequel disparait
+lsblk   # avant
+# debrancher un disque
+lsblk   # apres
+```
+
+**Schema Penta SATA HAT (vue de dessus) :**
 ```
 ┌──────────────────────┐
 │    Raspberry Pi      │
 ├──────────────────────┤
 │  Penta SATA HAT     │
-│  ┌────┐  ┌────┐     │  Rangee haut → md0 (sauvegarde)
-│  │ S1 │  │ S2 │     │  S1=sda, S2=sdb
+│  ┌────┐  ┌────┐     │  Rangee haut (sda, sdb)
+│  │ S1 │  │ S2 │     │
 │  └────┘  └────┘     │
-│  ┌────┐  ┌────┐     │  Rangee bas → md1 (encrypted)
-│  │ S3 │  │ S4 │     │  S3=sdc, S4=sdd
+│  ┌────┐  ┌────┐     │  Rangee bas (sdc, sdd)
+│  │ S3 │  │ S4 │     │
 │  └────┘  └────┘     │
-│  ┌────┐              │  5e port (non utilise par Cryoss)
+│  ┌────┐              │  5e port
 │  │ S5 │              │
 │  └────┘              │
 └──────────────────────┘
 ```
 
-### Aucun disque detecte (`lsblk` ne montre que mmcblk0)
-
-99% du temps, c'est le PCIe qui n'est pas active sur RPi 5 :
-
+**Fixer l'ordre (optionnel, via udev) :**
 ```bash
-# Verifier
-grep dtparam /boot/firmware/config.txt
-# → dtparam=pciex1   doit etre present (sans #)
-
-lspci
-# → doit lister un controleur SATA. Si vide : PCIe inactif.
-
-# Corriger
-sudo sed -i '/^dtparam=pciex1/d' /boot/firmware/config.txt
-echo "dtparam=pciex1" | sudo tee -a /boot/firmware/config.txt
-sudo reboot
+echo 'SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXXX", SYMLINK+="disk-slot1"' \
+    > /etc/udev/rules.d/99-cryoss-disks.rules
+udevadm control --reload-rules
 ```
-
-Voir la section "Pre-installation — Activation PCIe" plus haut pour les details.
 
 ### Problemes courants
 
@@ -610,21 +340,11 @@ curl http://localhost:8420/healthz                   # ping
 | Fichier | Description |
 |---------|-------------|
 | `/etc/cryoss/keys-backup.conf` | **CRITIQUE : 3 paires de cles rclone** |
-| `/etc/cryoss/shares.conf` | Source de verite des partages Samba (wizard CLI + Console Analyss) |
-| `/etc/cryoss/master_key` | Master key Fernet (Console Analyss bidirectionnelle, 600 root:root) |
-| `/etc/cryoss/config.env` | Override roots filesystem (optionnel, 600 root:root) |
 | `/etc/cryoss/serial` | Numero de serie unique |
-| `/etc/cryoss/api-key` | Cle API locale |
-| `/etc/cryoss/analyss.conf` | URL + API key heartbeat Analyss |
-| `/etc/samba/cryoss-shares.conf` | Partages Samba dynamiques generes (NE PAS EDITER : regenere depuis shares.conf) |
-| `/var/lib/cryoss/last-shutdown.txt` | Dernier shutdown via commande Console (raison, ts) |
-| `/var/lib/cryoss/decrypted/<cmd_id>/` | Decryptes a la demande (TTL 1h, cleanup auto) |
+| `/etc/cryoss/api-key` | Cle API |
 | `/root/.config/rclone/rclone.conf` | Config rclone (3 remotes) |
 | `/root/.ssh/cryoss_rpi2` | Cle SSH vers RPi2 |
 | `/usr/local/bin/cryoss-backup.sh` | Script backup principal |
-| `/var/lib/cryoss/install.state` | Etapes d'installation validees (resume) |
-| `/var/lib/cryoss/install.env` | Variables d'install collectees (sensible — 600 root) |
-| `/var/log/cryoss-install.log` | Log brut de l'installation (commandes encapsulees) |
 | `/var/log/cryoss-backup.log` | Log backup |
 | `/var/log/rclone_cryoss.log` | Log rclone |
 | `/var/log/cryoss-health.log` | Log monitoring |

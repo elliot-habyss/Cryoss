@@ -30,10 +30,8 @@
 # Le script lit la config DEPUIS L'INSTALLATION EXISTANTE — pas de questions.
 #
 # Usage :
-#   sudo bash update.sh              # RPi1 (full update)
-#   sudo bash update.sh --rpi2       # RPi2 (full update)
-#   sudo bash update.sh --check      # Dry-run : liste les MAJ disponibles
-#                                    #            sur les paquets Cryoss-critiques
+#   sudo bash update.sh              # RPi1
+#   sudo bash update.sh --rpi2       # RPi2
 # ===========================================================================
 
 set -euo pipefail
@@ -49,39 +47,7 @@ step() { echo -e "\n${BOLD}${BLUE}━━━ $1 ━━━${NC}"; }
 [[ $EUID -ne 0 ]] && err "Root requis"
 
 IS_RPI2=false
-CHECK_ONLY=false
-case "${1:-}" in
-    --rpi2)  IS_RPI2=true ;;
-    --check) CHECK_ONLY=true ;;
-    "")      ;;
-    *)       err "Argument inconnu : $1 (utilisez --rpi2 ou --check)" ;;
-esac
-
-# ===========================================================================
-# Mode --check : dry-run informatif (utilisé par cryoss-command-runner pour
-# apt_update_check). Ne touche à rien, retourne la liste des MAJ disponibles
-# sur les paquets Cryoss-critiques uniquement (pas tout le système).
-# ===========================================================================
-if [[ "$CHECK_ONLY" == true ]]; then
-    info "Mode --check : dry-run (aucune modification)"
-    apt-get update -qq 2>/dev/null || warn "apt-get update a échoué (continue)"
-    echo
-    echo "=== Mises à jour disponibles (paquets Cryoss-critiques) ==="
-    PKGS_PATTERN='^(rclone|samba|samba-common|samba-common-bin|smbclient|libsmbclient|fail2ban|ufw|mdadm|msmtp|msmtp-mta|smartmontools|openssh-server|python3|python3-cryptography|curl)/'
-    UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep -E "$PKGS_PATTERN" || true)
-    if [[ -z "$UPGRADABLE" ]]; then
-        echo "(aucune mise à jour disponible sur les paquets Cryoss-critiques)"
-    else
-        echo "$UPGRADABLE"
-    fi
-    echo
-    echo "=== Versions actuelles installées ==="
-    for pkg in rclone samba mdadm fail2ban msmtp; do
-        v=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo "non installé")
-        printf "  %-30s %s\n" "$pkg" "$v"
-    done
-    exit 0
-fi
+[[ "${1:-}" == "--rpi2" ]] && IS_RPI2=true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 

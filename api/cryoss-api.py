@@ -29,19 +29,22 @@ Accès distant :
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
+import os
 import re
 import socket
 import subprocess
 import time
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 # ============================================================================
 # Config
@@ -69,60 +72,31 @@ _rate_store: dict[str, list[float]] = {}
 # ============================================================================
 
 
-def _result(rc: int, stdout: str, stderr: str) -> dict[str, Any]:
-    return {"ok": rc == 0, "stdout": stdout, "stderr": stderr, "rc": rc}
-
-
 def sh(cmd: str, timeout: int = 30) -> dict[str, Any]:
-    """Execute a hardcoded shell pipeline via sudo (shell=True).
-
-    /!\\ SECURITE — UTILISATION RESTREINTE :
-      - NE JAMAIS interpoler d'entrée utilisateur ici (même validée).
-      - Pour toute commande contenant un paramètre dynamique : utiliser sh_argv().
-      - Réservé aux pipelines/redirections/awk/grep avec arguments littéraux uniquement.
+    """Execute a shell command via sudo, return structured result.
 
     [A1] L'API tourne en tant que cryoss-api (non-root).
     Les commandes systeme sont executees via sudo (sudoers restreint).
     """
     try:
-        # nosec B602 - shell=True intentionnel : pipelines/redirections nécessaires.
-        # Justification documentée + interdiction d'interpoler de l'entrée utilisateur
-        # (cf. docstring + règle Semgrep cryoss-shell-true-with-fstring).
-        r = subprocess.run(  # nosec B602
+        r = subprocess.run(
             f"sudo {cmd}", shell=True, capture_output=True,
             text=True, timeout=timeout,
         )
-        return _result(r.returncode, r.stdout, r.stderr)
+        return {
+            "ok": r.returncode == 0,
+            "stdout": r.stdout,
+            "stderr": r.stderr,
+            "rc": r.returncode,
+        }
     except subprocess.TimeoutExpired:
-        return _result(-1, "", f"timeout ({timeout}s)")
+        return {"ok": False, "stdout": "", "stderr": f"timeout ({timeout}s)", "rc": -1}
     except Exception as e:
-        return _result(-99, "", str(e))
-
-
-def sh_argv(argv: list[str], timeout: int = 30, use_sudo: bool = True) -> dict[str, Any]:
-    """Execute a command via subprocess SANS shell (shell=False).
-
-    A utiliser pour TOUTE commande dont au moins un argument provient
-    (directement ou indirectement) d'une entrée utilisateur, même validée.
-
-    Pas d'expansion shell : pas de pipe, pas de redirection, pas de glob.
-    Pour combiner avec un pipeline interne, faire le post-traitement en
-    Python sur le stdout (ex: split + tail).
-    """
-    full = ["sudo", *argv] if use_sudo else list(argv)
-    try:
-        r = subprocess.run(
-            full, capture_output=True, text=True, timeout=timeout,
-        )
-        return _result(r.returncode, r.stdout, r.stderr)
-    except subprocess.TimeoutExpired:
-        return _result(-1, "", f"timeout ({timeout}s)")
-    except Exception as e:
-        return _result(-99, "", str(e))
+        return {"ok": False, "stdout": "", "stderr": str(e), "rc": -99}
 
 
 def sh_val(cmd: str, default: str = "N/A") -> str:
-    """Execute a command (shell, hardcoded only) and return stripped stdout."""
+    """Execute a command and return stripped stdout, or default on error."""
     r = sh(cmd, timeout=10)
     return r["stdout"].strip() if r["ok"] and r["stdout"].strip() else default
 
@@ -140,15 +114,13 @@ def detect_role() -> str:
         return "rpi1"
     if Path("/etc/cryoss/rpi2-role").exists():
         return "rpi2"
-    # Fallback : chercher l'IP interco dans la sortie de `ip addr show`
+    # Fallback: check interco IP
     try:
-        r = subprocess.run(
-            ["ip", "addr", "show"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if INTERCO_RPI2_IP in r.stdout:
+        import subprocess
+        r = subprocess.run("ip addr show 2>/dev/null | grep -q 10.42.0.2", shell=True)
+        if r.returncode == 0:
             return "rpi2"
-    except (subprocess.TimeoutExpired, OSError):
+    except:
         pass
     return "unknown"
 
@@ -191,6 +163,7 @@ async def verify_auth(authorization: str = Header(..., description="Bearer <API_
         hashlib.sha256(expected.encode()).digest(),
     ):
         # [A2] async-safe delay — ne bloque pas l'event loop
+        import asyncio
         await asyncio.sleep(0.5)
         raise HTTPException(401, "Invalid API key")
 
@@ -321,11 +294,9 @@ def status(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
     mounts = ["/etc/sauvegarde", "/etc/encrypted"] if role == "rpi1" else ["/etc/encrypted"]
     disks = {}
     for m in mounts:
-        r = sh_argv(["df", "-h", m])
-        if r["ok"] and r["stdout"]:
-            # On veut la dernière ligne (équivalent | tail -1)
-            last = r["stdout"].strip().splitlines()[-1] if r["stdout"].strip() else ""
-            parts = last.split()
+        r = sh(f"df -h {m} 2>/dev/null | tail -1")
+        if r["ok"]:
+            parts = r["stdout"].split()
             if len(parts) >= 5:
                 disks[m] = {"used": parts[2], "total": parts[1], "pct": parts[4]}
 
@@ -375,7 +346,7 @@ def smart(disk: str, serial: str = Depends(verify_auth), _=Depends(rate_limit)):
     """Données SMART pour un disque."""
     if not re.match(r"^(sd[a-z]|nvme\d+n\d+|mmcblk\d+)$", disk):
         raise HTTPException(400, f"Invalid disk name: {disk}")
-    return make_response(sh_argv(["smartctl", "-H", "-A", f"/dev/{disk}"]))
+    return make_response(sh(f"smartctl -H -A /dev/{disk} 2>/dev/null"))
 
 
 @app.get("/api/v1/system/disk")
@@ -406,9 +377,7 @@ def health(mode: str, serial: str = Depends(verify_auth), _=Depends(rate_limit))
     """Exécute le script de health check (daily/weekly/alert)."""
     if mode not in ("daily", "weekly", "alert"):
         raise HTTPException(400, "Mode must be: daily, weekly, alert")
-    return make_response(
-        sh_argv(["/usr/local/bin/cryoss-health.sh", mode], timeout=120)
-    )
+    return make_response(sh(f"/usr/local/bin/cryoss-health.sh {mode}", timeout=120))
 
 
 @app.get("/api/v1/watchdog")
@@ -450,11 +419,7 @@ def backup_history(
     _=Depends(rate_limit),
 ):
     """Historique des backups depuis le journal."""
-    return make_response(sh_argv([
-        "journalctl", "-u", "cryoss-backup.service",
-        "--no-pager", "-n", str(lines),
-        "--output", "short-iso",
-    ]))
+    return make_response(sh(f"journalctl -u cryoss-backup.service --no-pager -n {lines} --output short-iso"))
 
 
 @app.get("/api/v1/backup/archives")
@@ -495,16 +460,11 @@ def replication_status(serial: str = Depends(verify_auth), _=Depends(rate_limit)
 
     if role == "rpi1":
         # Vérifie depuis RPi1 : les fichiers sur RPi2
-        ssh_short = [
-            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-            f"{INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP}",
-        ]
-        rpi2_count = sh_argv([*ssh_short, "find /etc/encrypted/rpi1 -type f 2>/dev/null | wc -l"])
         return make_response({
-            "rpi2_reachable": sh_argv([*ssh_short, "echo ok"])["ok"],
-            "rpi2_latest": sh_argv([*ssh_short, "ls -lt /etc/encrypted/rpi1/ 2>/dev/null | head -5"]),
-            "rpi2_count": rpi2_count["stdout"].strip() if rpi2_count["ok"] else "N/A",
-            "rpi2_disk": sh_argv([*ssh_short, "df -h /etc/encrypted"]),
+            "rpi2_reachable": sh(f"ssh -o BatchMode=yes -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'echo ok' 2>/dev/null")["ok"],
+            "rpi2_latest": sh(f"ssh -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'ls -lt /etc/encrypted/rpi1/ 2>/dev/null | head -5'"),
+            "rpi2_count": sh_val(f"ssh -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'find /etc/encrypted/rpi1 -type f 2>/dev/null | wc -l'"),
+            "rpi2_disk": sh(f"ssh -o ConnectTimeout=5 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP} 'df -h /etc/encrypted'"),
         })
     else:
         # RPi2 : montre la réception locale
@@ -555,7 +515,7 @@ def tail_log(
     """Tail d'un fichier log. Logs autorisés : backup, rclone, health, honeypot, msmtp, syslog, auth, samba."""
     if name not in ALLOWED_LOGS:
         raise HTTPException(400, f"Unknown log '{name}'. Allowed: {list(ALLOWED_LOGS.keys())}")
-    return make_response(sh_argv(["tail", "-n", str(lines), ALLOWED_LOGS[name]]))
+    return make_response(sh(f"tail -n {lines} {ALLOWED_LOGS[name]} 2>/dev/null"))
 
 
 @app.get("/api/v1/logs/{name}/search")
@@ -566,20 +526,12 @@ def search_log(
     serial: str = Depends(verify_auth),
     _=Depends(rate_limit),
 ):
-    """Recherche dans un log (grep -F, recherche littérale)."""
+    """Recherche dans un log (grep)."""
     if name not in ALLOWED_LOGS:
         raise HTTPException(400, f"Unknown log '{name}'.")
-    # grep -F : fixed-string (pas regex). Avec sh_argv (shell=False), q
-    # est passé tel quel à grep — pas d'escape nécessaire, pas d'injection possible.
-    res = sh_argv(["grep", "-iF", "--", q, ALLOWED_LOGS[name]])
-    # Tail en Python (pas de pipe shell) : on garde les N dernières lignes du match.
-    if res["stdout"]:
-        res["stdout"] = "\n".join(res["stdout"].splitlines()[-lines:])
-    # grep retourne 1 quand il n'y a aucun match — ne pas considérer comme erreur
-    if res["rc"] == 1 and not res["stderr"]:
-        res["ok"] = True
-        res["rc"] = 0
-    return make_response(res)
+    # Sanitize query to prevent injection
+    safe_q = q.replace("'", "'\\''")
+    return make_response(sh(f"grep -i '{safe_q}' {ALLOWED_LOGS[name]} 2>/dev/null | tail -n {lines}"))
 
 
 # ============================================================================
@@ -662,52 +614,33 @@ def get_config(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
 # ============================================================================
 
 
-SSH_RPI2_ARGS = [
-    "ssh",
-    "-o", "BatchMode=yes",
-    "-o", "ConnectTimeout=10",
-    f"{INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP}",
-]
-
-
-def _ssh_val(remote_cmd: str, default: str = "N/A") -> str:
-    """Wrapper sh_val pour commandes SSH RPi2."""
-    r = sh_argv([*SSH_RPI2_ARGS, remote_cmd], timeout=15)
-    return r["stdout"].strip() if r["ok"] and r["stdout"].strip() else default
-
-
 @app.get("/api/v1/rpi2/status")
 def rpi2_status(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
     """Status complet RPi2 (via SSH interco)."""
+    base = f"ssh -o BatchMode=yes -o ConnectTimeout=10 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP}"
+
     # Test connexion d'abord
-    reachable = sh_argv([*SSH_RPI2_ARGS, "echo ok"])
+    reachable = sh(f"{base} 'echo ok' 2>/dev/null")
     if not reachable["ok"]:
         return make_response(None, error="RPi2 unreachable via interco")
 
     return make_response({
         "reachable": True,
-        "raid": sh_argv([*SSH_RPI2_ARGS, "cat /proc/mdstat"]),
-        "disk": sh_argv([*SSH_RPI2_ARGS, "df -h /etc/encrypted"]),
-        "services": sh_argv([*SSH_RPI2_ARGS, "systemctl is-active ssh fail2ban"]),
-        "uptime": _ssh_val("uptime -p"),
-        "temp": _ssh_val(
-            "awk '{printf \"%.1f\", $1/1000}' /sys/class/thermal/thermal_zone0/temp"
-        ),
-        "reception": sh_argv([*SSH_RPI2_ARGS,
-            "ls -lt /etc/encrypted/rpi1/ 2>/dev/null | head -10"]),
-        "reception_count": _ssh_val(
-            "find /etc/encrypted/rpi1 -type f 2>/dev/null | wc -l"
-        ),
+        "raid": sh(f"{base} 'cat /proc/mdstat'"),
+        "disk": sh(f"{base} 'df -h /etc/encrypted'"),
+        "services": sh(f"{base} 'systemctl is-active ssh fail2ban'"),
+        "uptime": sh_val(f"{base} 'uptime -p'"),
+        "temp": sh_val(f"{base} \"awk '{{printf \\\"%.1f\\\", \\$1/1000}}' /sys/class/thermal/thermal_zone0/temp\""),
+        "reception": sh(f"{base} 'ls -lt /etc/encrypted/rpi1/ 2>/dev/null | head -10'"),
+        "reception_count": sh_val(f"{base} 'find /etc/encrypted/rpi1 -type f 2>/dev/null | wc -l'"),
     })
 
 
 @app.get("/api/v1/rpi2/raid")
 def rpi2_raid(serial: str = Depends(verify_auth), _=Depends(rate_limit)):
     """RAID détaillé RPi2."""
-    return make_response(sh_argv([
-        *SSH_RPI2_ARGS,
-        "mdadm --detail /dev/md0 2>/dev/null",
-    ]))
+    base = f"ssh -o BatchMode=yes -o ConnectTimeout=10 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP}"
+    return make_response(sh(f"{base} 'mdadm --detail /dev/md0 2>/dev/null'"))
 
 
 @app.get("/api/v1/rpi2/smart/{disk}")
@@ -715,11 +648,8 @@ def rpi2_smart(disk: str, serial: str = Depends(verify_auth), _=Depends(rate_lim
     """SMART RPi2."""
     if not re.match(r"^(sd[a-z]|nvme\d+n\d+)$", disk):
         raise HTTPException(400, f"Invalid disk: {disk}")
-    # disk validé par regex — interpolé dans la commande remote (parsée par le shell distant)
-    return make_response(sh_argv([
-        *SSH_RPI2_ARGS,
-        f"smartctl -H -A /dev/{disk} 2>/dev/null",
-    ]))
+    base = f"ssh -o BatchMode=yes -o ConnectTimeout=10 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP}"
+    return make_response(sh(f"{base} 'smartctl -H -A /dev/{disk} 2>/dev/null'"))
 
 
 @app.get("/api/v1/rpi2/logs/{name}")
@@ -737,11 +667,8 @@ def rpi2_logs(
     }
     if name not in rpi2_logs_map:
         raise HTTPException(400, f"RPi2 logs allowed: {list(rpi2_logs_map.keys())}")
-    # name whitelisté, lines int validé par Query — sûrs à interpoler
-    return make_response(sh_argv([
-        *SSH_RPI2_ARGS,
-        f"tail -n {lines} {rpi2_logs_map[name]} 2>/dev/null",
-    ]))
+    base = f"ssh -o BatchMode=yes -o ConnectTimeout=10 {INTERCO_ADMIN_USER}@{INTERCO_RPI2_IP}"
+    return make_response(sh(f"{base} 'tail -n {lines} {rpi2_logs_map[name]} 2>/dev/null'"))
 
 
 # ============================================================================

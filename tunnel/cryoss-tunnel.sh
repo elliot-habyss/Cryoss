@@ -41,21 +41,15 @@ echo -e "  Serial     : ${BOLD}$SERIAL${NC}"
 echo -e "  SSH port   : ${BOLD}$TUNNEL_SSH_PORT${NC}"
 echo -e "  API port   : ${BOLD}$TUNNEL_API_PORT${NC}\n"
 
-# --- Paramètres (validation stricte avant injection dans systemd) ---
+# --- Paramètres ---
 read -rp "  IP/hostname du serveur VPS Analyss : " VPS_HOST
 [[ -z "$VPS_HOST" ]] && err "IP VPS obligatoire"
-[[ "$VPS_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,253}$ ]] \
-    || err "Hostname VPS invalide (caractères autorisés : A-Z a-z 0-9 . -)"
 
 read -rp "  Utilisateur SSH sur le VPS [cryoss-tunnel] : " VPS_USER
 VPS_USER="${VPS_USER:-cryoss-tunnel}"
-[[ "$VPS_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
-    || err "Utilisateur SSH invalide (format Linux : [a-z_][a-z0-9_-]{0,31})"
 
 read -rp "  Port SSH du VPS [22] : " VPS_PORT
 VPS_PORT="${VPS_PORT:-22}"
-[[ "$VPS_PORT" =~ ^[0-9]{1,5}$ ]] && (( VPS_PORT >= 1 && VPS_PORT <= 65535 )) \
-    || err "Port SSH invalide (1-65535)"
 
 # --- Installer autossh ---
 if ! command -v autossh &>/dev/null; then
@@ -92,25 +86,7 @@ echo ""
 read -rp "  Clé ajoutée sur le VPS ? [o/N] : " CONFIRM
 [[ "${CONFIRM,,}" != "o" && "${CONFIRM,,}" != "y" ]] && err "Abandon — ajoutez la clé d'abord"
 
-# --- Afficher l'empreinte du VPS pour vérification hors-bande ---
-info "Récupération de la clé publique du VPS..."
-VPS_FP=""
-if VPS_FP=$(ssh-keyscan -t ed25519 -p "$VPS_PORT" "$VPS_HOST" 2>/dev/null \
-            | ssh-keygen -lf - 2>/dev/null) && [[ -n "$VPS_FP" ]]; then
-    echo ""
-    echo -e "  Empreinte SSH du VPS (à vérifier hors-bande, ex. téléphone) :"
-    echo -e "    ${BOLD}${VPS_FP}${NC}"
-    echo ""
-    read -rp "  L'empreinte correspond à celle communiquée par Analyss ? [o/N] : " FP_OK
-    [[ "${FP_OK,,}" == "o" || "${FP_OK,,}" == "y" ]] \
-        || err "Abandon — empreinte VPS non confirmée (risque MITM)"
-else
-    warn "Impossible de récupérer la clé du VPS — vérifier hostname/port"
-    read -rp "  Continuer en TOFU (Trust On First Use) ? [o/N] : " FP_OK
-    [[ "${FP_OK,,}" == "o" || "${FP_OK,,}" == "y" ]] || err "Abandon"
-fi
-
-# --- Tester la connexion (clé pinnée par accept-new) ---
+# --- Tester la connexion ---
 info "Test de connexion vers $VPS_HOST..."
 if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
     -i "$TUNNEL_KEY" -p "$VPS_PORT" "${VPS_USER}@${VPS_HOST}" "echo ok" 2>/dev/null | grep -q ok; then

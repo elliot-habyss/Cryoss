@@ -37,7 +37,7 @@ Avant de partir sur site, verifier :
 
 Sur les deux RPis :
 
-1. Telecharger **Raspberry Pi OS Lite 64-bit** (derniere version stable, Bookworm minimum).
+1. Telecharger **Raspberry Pi OS Lite 64-bit** (derniere version stable).
 2. Flasher l'image sur chaque carte microSD avec Raspberry Pi Imager ou `dd`.
 3. Configurer via Imager (ou fichiers dans la partition boot) :
    - Activer SSH.
@@ -45,103 +45,6 @@ Sur les deux RPis :
    - Configurer le hostname : `cryoss-rpi1` et `cryoss-rpi2`.
 4. Inserer les cartes SD et demarrer chaque RPi.
 5. Se connecter en SSH pour verifier le bon demarrage.
-
----
-
-## Etape 2bis -- Activation PCIe pour le Penta SATA HAT (CRITIQUE)
-
-**A faire sur RPi1 ET RPi2 avant les scripts d'installation.** Sans cette
-manip, le kernel Raspberry Pi 5 n'enumere pas le bus PCIe et les disques du
-Penta SATA HAT sont invisibles (`lsblk` ne montre que `mmcblk0`).
-
-### 2bis.1 Activer le PCIe
-
-```bash
-sudo nano /boot/firmware/config.txt
-```
-
-Ajouter en fin de fichier :
-
-```ini
-# Cryoss — Penta SATA HAT (PCIe x1 activation)
-dtparam=pciex1
-# Optionnel : forcer Gen 3 (5 GT/s). A activer SEULEMENT si dtparam=pciex1
-# seul fonctionne deja, pour eviter les regressions sur cables/HATs limites.
-# dtparam=pciex1_gen=3
-```
-
-```bash
-sudo reboot
-```
-
-### 2bis.2 Verifier la detection
-
-```bash
-# 1) Le bus PCIe doit apparaitre
-lspci
-# Exemple : "0000:01:00.0 SATA controller: ASMedia Technology Inc. ASM1166"
-
-# 2) Les disques doivent etre listes
-lsblk -d -o NAME,SIZE,MODEL,SERIAL,TRAN
-# Exemple :
-#   sda  3.6T  ST4000VN008  WD-ABCDE12  sata
-#   sdb  3.6T  ST4000VN008  WD-FGHIJ34  sata
-#   sdc  3.6T  ST4000VN008  WD-KLMNO56  sata
-#   sdd  3.6T  ST4000VN008  WD-PQRST78  sata
-```
-
-### 2bis.3 Identifier physiquement chaque disque
-
-**A faire avant `install_rpi1.sh`** — le script formate les disques. Si on se
-trompe d'identification, le depannage en cas de panne disque (remplacement a
-chaud) sera laborieux : il faudra a nouveau passer par `dd` ou desassembler.
-
-```bash
-# Faire clignoter chaque disque tour a tour pour reperer la baie HAT
-for d in /dev/sda /dev/sdb /dev/sdc /dev/sdd; do
-    echo "Clignotement de $d pendant 10s — observe les LEDs..."
-    sudo dd if="$d" of=/dev/null bs=1M count=2000 status=none &
-    sleep 10
-    wait
-    read -rp "  Quelle baie HAT ? (1/2/3/4) : " baie
-    serial=$(sudo smartctl -i "$d" | awk '/Serial Number/{print $3}')
-    echo "  → Baie $baie = $d = serial $serial"
-done
-```
-
-**Coller une etiquette physique sur chaque disque** :
-- Numero de baie HAT (1 a 4)
-- 6 derniers chiffres du serial
-- Role Cryoss (md0=sauvegarde / md1=encrypted)
-
-**Layout de reference Cryoss** :
-
-| Baie HAT | /dev/* | RAID | Role |
-|----------|--------|------|------|
-| S1 (haut-gauche)  | sda | md0 | /etc/sauvegarde (donnees client) |
-| S2 (haut-droit)   | sdb | md0 | /etc/sauvegarde (miroir) |
-| S3 (bas-gauche)   | sdc | md1 | /etc/encrypted (chiffre rclone) |
-| S4 (bas-droit)    | sdd | md1 | /etc/encrypted (miroir) |
-
-### 2bis.4 (Recommande) Liens stables via udev
-
-Les noms `sdX` peuvent permuter au reboot. Cryoss utilise les UUID donc le
-RAID n'est pas affecte, mais des liens stables `/dev/cryoss/baieN` facilitent
-le depannage :
-
-```bash
-sudo tee /etc/udev/rules.d/99-cryoss-disks.rules <<'EOF'
-# Remplacer chaque WD-XXXX par les serials releves a l'etape 2bis.3
-SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXX1", SYMLINK+="cryoss/baie1"
-SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXX2", SYMLINK+="cryoss/baie2"
-SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXX3", SYMLINK+="cryoss/baie3"
-SUBSYSTEM=="block", ATTRS{serial}=="WD-XXXX4", SYMLINK+="cryoss/baie4"
-EOF
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-ls -l /dev/cryoss/   # → baie1 -> ../sda, etc.
-```
 
 ---
 
@@ -186,81 +89,22 @@ Le script est **interactif**. Il demandera :
 - Nom du client (utilise pour les chemins et la config).
 - Mot de passe SMTP (pour l'envoi des alertes email).
 - Configuration reseau : IP LAN client, passerelle, DNS, masque.
-- Activation SFTP distant (optionnel, chemin C3).
-- Lancement du wizard de partages Samba personnalises (etape 11b).
-
-#### Modes de reprise et de rejeu
-
-L'install est decoupee en 15 etapes avec checkpoints persistants. Si elle est
-interrompue ou si un parametre doit etre change apres coup :
-
-```bash
-# Voir l'etat des etapes
-sudo bash install_rpi1.sh --list-steps
-
-# Reprendre apres interruption
-sudo bash install_rpi1.sh --resume
-
-# Repartir depuis une etape precise (rejoue celle-la + suivantes)
-sudo bash install_rpi1.sh --from-step 11-samba
-
-# Rejouer UNE SEULE etape (ex : ajouter de nouveaux partages plus tard)
-sudo bash install_rpi1.sh --only-step 11b-samba-wizard
-
-# Tout effacer pour repartir de zero
-sudo bash install_rpi1.sh --reset
-
-# Aide
-sudo bash install_rpi1.sh --help
-```
-
-**Fichiers d'etat (mode 600 root)** :
-- `/var/lib/cryoss/install.state` — etapes validees
-- `/var/lib/cryoss/install.env` — variables collectees (mots de passe inclus)
-- `/var/log/cryoss-install.log` — log brut des commandes
+- Activation SFTP (optionnel, pour l'acces client direct).
 
 ### 4.3 Ce que fait le script
 
-Le script `install_rpi1.sh` effectue dans l'ordre (15 etapes, IDs entre parentheses) :
+Le script `install_rpi1.sh` effectue dans l'ordre :
 
-1. **Paquets** (`01-packages`) : installation de mdadm, rclone, samba, msmtp, smartmontools, ufw, fail2ban, etc.
-2. **IP fixe** (`02-network`) : configuration de l'interface LAN avec l'IP client et de l'interface interco en 10.42.0.1/30.
-3. **RAID 1** (`03-raid`) : creation de md0 (sda+sdb -> /etc/sauvegarde) et md1 (sdc+sdd -> /etc/encrypted), formatage ext4.
-4. **Repertoires et montage** (`04-mounts`) : montage des md, persistance fstab, mdadm.conf, initramfs.
-5. **Utilisateurs systeme** (`05-users`) : creation des comptes `ds-user` (Samba R/W, nologin), `habyss` (admin sudo+SSH+Samba).
-6. **rclone** (`06-rclone`) : generation des 3 paires de cles (C1/C2/C3), config rclone avec 3 remotes crypt independants, sauvegarde dans `/etc/cryoss/keys-backup.conf`.
-7. **Cle SSH RPi2** (`07-ssh-rpi2`) : generation de la cle ED25519 `cryoss_rpi2`, copie automatique vers RPi2.
-8. **msmtp + relais SMTP** (`09-msmtp`) : config msmtp pour les alertes, postfix null-client pour relayer les emails du RPi2.
-9. **Librairie email HTML** (`09b-emaillib`) : `/usr/local/lib/cryoss-email.sh` partagee.
-10. **Script backup** (`10-backup-script`) : `/usr/local/bin/cryoss-backup.sh` (3 chemins independants, lockfile, alertes HTML).
-11. **Samba de base** (`11-samba`) : `[sauvegarde]` (R/W ds-user+habyss) et `[encrypted_backup]` (R-only habyss). SMB2+ + chiffrement force.
-12. **Wizard Samba** (`11b-samba-wizard`) : (interactif) creation de partages personnalises, utilisateurs Samba purs (nologin + Unix locked), matrice de droits.
-13. **Services et timers** (`12-systemd`) : `cryoss-backup.timer` (02h), `cryoss-sftp-sync.timer` (06h/08h/14h/20h).
-14. **Durcissement** (`13-hardening`) : SSH durci, UFW, fail2ban, sysctl, logrotate.
-15. **Monitoring** (`14-monitoring`) : `cryoss-health.sh` + timers daily/weekly/watchdog.
-
-#### Wizard de partages personnalises (etape 11b)
-
-Cree des dossiers-partages supplementaires sous `/etc/sauvegarde` (ou autre
-chemin) avec des utilisateurs Samba **purs** :
-
-- `useradd -r -M -s /usr/sbin/nologin -d /nonexistent` — pas de home, pas de shell
-- `passwd -l` — mot de passe Unix verrouille (impossible de SSH ou login console)
-- `smbpasswd -a` — seul Samba peut authentifier ces utilisateurs
-
-La **matrice user × partage** definit pour chaque combinaison : `R` (lecture
-seule), `RW` (lecture + ecriture) ou `–` (refus). Le wizard genere les blocs
-Samba avec `valid users` / `read list` / `write list` / `invalid users` qui vont.
-
-Persistance :
-- `/etc/cryoss/shares.conf` — source de verite (rejouable)
-- `/etc/samba/cryoss-shares.conf` — partages effectifs inclus depuis `smb.conf`
-
-Pour ajouter / modifier des partages plus tard, sans toucher au reste :
-
-```bash
-sudo bash install_rpi1.sh --only-step 11b-samba-wizard
-```
+1. **Paquets** : installation de mdadm, rclone, samba, msmtp, jq, smartmontools, etc.
+2. **IP fixe** : configuration de l'interface LAN avec l'IP client et de l'interface interco en 10.42.0.1/30.
+3. **RAID 5** : creation de la grappe RAID 5 sur les 4 disques, formatage ext4, montage sur `/mnt/raid`.
+4. **Utilisateurs** : creation des comptes `ds-user` (acces Samba), `habyss` (administration), `ds-repl` (replication vers RPi2).
+5. **Cles rclone** : generation de 3 paires de cles de chiffrement (C1, C2, C3), stockees dans `/root/.config/rclone/rclone.conf` et sauvegardees dans `/etc/cryoss/keys-backup.conf`.
+6. **Samba** : configuration du partage pour le client (acces via `ds-user`).
+7. **SSH** : generation de la cle SSH `cryoss_rpi2` pour la connexion automatique vers RPi2.
+8. **Script de sauvegarde** : installation de `cryoss-backup.sh` et du timer systemd associe.
+9. **Script de sante** : installation de `cryoss-health.sh` et des timers (quotidien, hebdomadaire, watchdog).
+10. **Timers systemd** : activation de tous les timers.
 
 ---
 
@@ -412,9 +256,6 @@ Corriger toute erreur avant de passer a l'etape finale.
 
 ## Checklist post-installation
 
-- [ ] `dtparam=pciex1` present dans `/boot/firmware/config.txt` (les deux RPis)
-- [ ] Disques etiquetes physiquement (baie HAT + role md0/md1)
-- [ ] Tous les disques detectes (`lsblk` montre sda/sdb/sdc/sdd sur RPi1)
 - [ ] RAID RPi1 en etat `active` (4/4 disques)
 - [ ] RAID RPi2 en etat `active` (2/2 disques)
 - [ ] Interco fonctionnelle (ping 10.42.0.1 <-> 10.42.0.2)
@@ -429,6 +270,3 @@ Corriger toute erreur avant de passer a l'etape finale.
 - [ ] RPi2 deconnecte du LAN client
 - [ ] Numero de serie DS-XXXXXXXX note dans le dossier client
 - [ ] Copie offline des cles remise au responsable (si politique client)
-- [ ] **Decision sur `/var/lib/cryoss/install.env`** (contient mots de passe SMTP/SFTP en clair, mode 600 root) :
-  - Soit le conserver pour permettre `--resume`/`--from-step` (poste dedie)
-  - Soit le supprimer apres install reussie : `sudo rm /var/lib/cryoss/install.env`
